@@ -3,7 +3,7 @@
 CAOS 是一个可烧录到 x86_64 机器（SD 卡 / USB / 磁盘）的气隙证书授权系统。它由两大部分组成：
 
 - `caos-ca`：使用 Rust 编写的命令行 CA 工具，提供根 CA / 中间 CA 初始化、终端证书签发、列表、吊销与完整性校验。最终产物是静态链接的 `x86_64-unknown-linux-musl` ELF。
-- Buildroot 镜像：64 MiB FAT32 启动分区 + 只读 squashfs 根文件系统 + 预留的 LUKS2 数据分区；内核关闭整个网络栈，rootfs 不含网络客户端或远程登录服务。
+- Buildroot 镜像：64 MiB FAT32 EFI System Partition（ESP）+ 只读 squashfs 根文件系统 + 预留的 LUKS2 数据分区；标准 GPT、纯 x86_64 UEFI（GRUB EFI）启动，不支持 Legacy BIOS/CSM。内核关闭整个网络栈，rootfs 不含网络客户端或远程登录服务。
 
 > **重要：本轮没有进行 QEMU 或真机启动测试。** 本文档描述的是已实际构建、静态检查和镜像内容验证的结果，不是启动验收报告。首次启动流程仍需在目标硬件上验证。第 9 节列出了所有已知限制。
 
@@ -38,13 +38,14 @@ project/
 │   │   ├── linux.fragment            # 气隙内核配置片段
 │   │   ├── busybox.fragment          # 关闭全部网络相关 BusyBox applet
 │   │   ├── rootfs-overlay/           # /etc、init.d、只读配置
-│   │   ├── extlinux.conf
-│   │   ├── genimage.cfg              # 混合 MBR/GPT、三分区布局
+│   │   ├── grub-builtin.cfg          # 嵌入 EFI 的 ESP 查找与 grub.cfg 加载
+│   │   ├── grub.cfg                  # ESP 上的 CAOS 启动菜单和内核命令行
+│   │   ├── genimage.cfg              # 标准 GPT、ESP + 根分区 + 数据分区
+│   │   ├── validate-image.py         # 独立解析 GPT/ESP 的镜像验收器
 │   │   ├── post-build.sh
 │   │   ├── post-fakeroot.sh          # 记录最终 root:root / caos:caos 属主
-│   │   ├── post-image.sh             # FAT32、SYSLINUX、genimage、MBR
+│   │   ├── post-image.sh             # FAT32 ESP、GRUB EFI、genimage GPT
 │   │   └── users.txt                 # caos UID/GID 1000
-│   └── package/caos-syslinux/        # host-only SYSLINUX 安装器
 ├── build.sh                          # 一键构建（Rust → Buildroot → 验证）
 ├── README.md
 └── output/                           # 所有构建输出（不在 Buildroot 源码树内）
@@ -61,15 +62,21 @@ Buildroot 浅克隆 `../buildroot-2026.08.1/` 未做修改。下载目录通过 
 
 ### 镜像布局
 
-`output/images/sdcard.img` 使用混合 MBR/GPT 分区表。GPT 分区名为契约标签，MBR 表同时保留传统 BIOS 可引导分区标志。
+`output/images/sdcard.img` 使用**标准 GPT**，不再生成混合 MBR/GPT 启动布局。GPT 本身按规范在 LBA 0 写一个仅含 `0xEE` 保护项的保护性 MBR；它不是 BIOS 启动路径，前 440 字节没有引导代码、没有 active 分区，也不安装 SYSLINUX 或 BIOS MBR 引导代码。p1 的 GPT 类型是 EFI System Partition（`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`），不是普通 FAT 基本数据分区。
 
-| 分区 | GPT 名称 / FAT 卷标 | 大小 | 内容 | 文件系统 |
-|---|---|---|---|---|
-| p1 | `CAOSBOOT` | 64 MiB | `zImage`、`/extlinux/extlinux.conf`、SYSLINUX | FAT32，卷标 `CAOSBOOT` |
-| p2 | `CAOSROOT` | 128 MiB | squashfs 只读根文件系统 | squashfs |
-| p3 | `CAOSDATA` | 128 MiB | **构建时留空**，首次启动手工 LUKS2 格式化 | 初始无文件系统；之后为 LUKS2 + ext4 |
+| 分区 | GPT 名称 / 文件系统 | 大小 | 内容 |
+|---|---|---|---|
+| p1 | `CAOSBOOT`，FAT32 ESP | 64 MiB | `\EFI\BOOT\BOOTX64.EFI`、`\EFI\BOOT\grub.cfg`、`\zImage` |
+| p2 | `CAOSROOT`，squashfs | 128 MiB | 只读根文件系统 |
+| p3 | `CAOSDATA`，初始为空 | 128 MiB | **构建时留空**，首次启动手工 LUKS2 格式化 |
 
-p3 在镜像构建阶段不会运行 `luksFormat`。LUKS header 和 CA 私钥都不在 `sdcard.img` 中。
+UEFI 固件通过可移动介质默认路径 `\EFI\BOOT\BOOTX64.EFI` 启动 GRUB；GRUB 用嵌入式脚本按 FAT 卷标 `CAOSBOOT` 找到 ESP，再执行 `/EFI/BOOT/grub.cfg`。内核仍在 ESP 根目录，命令行通过 GRUB 的 `linux` 命令传递：
+
+```text
+console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait
+```
+
+p3 在镜像构建阶段不会运行 `luksFormat`。LUKS header 和 CA 私钥都不在 `sdcard.img` 中。`S10caos-data` 依靠 GPT 标签 `CAOSDATA` 定位它，这一首次启动流程没有改变。
 
 ---
 
@@ -93,9 +100,9 @@ rustup toolchain install stable
 rustup target add x86_64-unknown-linux-musl
 ```
 
-`musl-gcc`（`musl-tools` 包）是必需的：`ring` 的 C/汇编代码必须用 musl C 工具链编译。`build.sh` 会检查 `rustup target`、`musl-gcc`、`unsquashfs`、`file` 等前置条件；缺失时直接失败，不会伪造成功。
+`musl-gcc`（`musl-tools` 包）是必需的：`ring` 的 C/汇编代码必须用 musl C 工具链编译。`build.sh` 会检查 `rustup target`、`musl-gcc`、`unsquashfs`、`python3`、`file` 等前置条件；缺失时直接失败，不会伪造成功。
 
-Buildroot 会自行构建 host 工具（host-genimage、host-mtools、host-dosfstools、host-caos-syslinux 等），因此不需要手工安装这些工具。
+Buildroot 会自行构建 host 工具（host-genimage、host-mtools、host-dosfstools、host-grub2、target grub2 等），因此不需要手工安装这些工具。UEFI 启动链使用 Buildroot 2026.08.1 自带的 **GRUB 2.14 x86_64-efi** 包；配置中只选择 `BR2_TARGET_GRUB2_X86_64_EFI`，没有选择 `i386-pc` 或其他 BIOS 平台，也没有自定义 SYSLINUX 包。
 
 ### 2.2 网络要求
 
@@ -114,26 +121,27 @@ cd project
 ./build.sh
 ```
 
-脚本使用 `set -euo pipefail`，任一阶段失败立即退出。阶段如下：
+如果构建机内存较小，可用 `JOBS=8 ./build.sh` 限制 Buildroot 并发；本项目在约 14 GiB 内存的主机上使用 `JOBS=8` 完成最终构建。脚本使用 `set -euo pipefail`，任一阶段失败立即退出。阶段如下：
 
 1. 检查/安装 `x86_64-unknown-linux-musl` target；
 2. `cargo build --release --target x86_64-unknown-linux-musl`，检查 `file` 输出包含 `statically linked`，运行 `cargo clippy -- -D warnings`，将二进制安装到 overlay；
 3. 执行 `make O=output BR2_EXTERNAL=caos-buildroot caos_defconfig`；
 4. 执行完整 Buildroot 构建（大阶段，耗时最长）；
-5. 验证 `sdcard.img`、内核 `CONFIG_NET`、`rootfs.squashfs` 与镜像内文件，并打印产物大小。
+5. 验证标准 GPT/ESP 分区表、`\EFI\BOOT\BOOTX64.EFI` 默认启动路径、GRUB 命令行、内核 `CONFIG_NET`/GPT 设置、`rootfs.squashfs` 与镜像内文件，并打印产物大小。
 
-预计耗时：在 24 核机器上，首次构建（含下载、工具链、内核、squashfs、镜像）通常需要 **约 15–40 分钟**，主要取决于网络与 CPU。增量构建会快很多。本次保留 `output/dl` 下载缓存、清空其余构建输出后完整重跑，Buildroot 全部目标包重新编译，约 **12 分 20 秒** 到 Stage 5；最终镜像（含一次只影响 rootfs 文件的增量重建）完成时间约 **14 分钟**。实测数据见第 8 节。
+预计耗时：在 24 核机器上，首次构建（含下载、工具链、内核、squashfs、镜像）通常需要 **约 15–40 分钟**，主要取决于网络、内存与 CPU。增量构建会快很多。本次保留 `output/dl` 下载缓存、清空其余构建输出后，以 `JOBS=8` 完整重跑；Buildroot 全部目标包、内核、GRUB EFI、squashfs、ESP 和 GPT 镜像均重新生成，从 20:15 到最终镜像完成约 **21 分钟**。实测数据见第 8 节。
 
 产物：
 
 ```
-output/images/bzImage            # Buildroot 编译出的内核（已放入 boot.vfat）
-output/images/boot.vfat          # p1 的 FAT32 启动分区
-output/images/rootfs.squashfs    # p2 的只读根文件系统
-output/images/sdcard.img         # 完整可烧录镜像
+output/images/bzImage                     # Buildroot 编译出的内核
+output/images/efi-part/EFI/BOOT/bootx64.efi # Buildroot GRUB EFI 应用
+output/images/boot.vfat                   # p1 的 FAT32 ESP
+output/images/rootfs.squashfs             # p2 的只读根文件系统
+output/images/sdcard.img                  # 完整可烧录 GPT 镜像
 ```
 
-`boot.vfat` 由 `mkfs.vfat` + mcopy + 不依赖 root 的 mtools 版 SYSLINUX 安装器生成；`sdcard.img` 由 `genimage` 生成。整个过程不需要 loop mount、mount 或 root 权限。镜像内 `/usr/bin/caos-ca` 由 Buildroot fakeroot 阶段记录为 `root:root 0755`；构建主机上的 overlay 源文件保留构建用户的属主，这是无 root 构建的正常行为，最终 squashfs 中已验证为 root。
+`boot.vfat` 由 `mkfs.vfat` + `mcopy` 生成，包含 `\EFI\BOOT\BOOTX64.EFI`、`\EFI\BOOT\grub.cfg` 和 `\zImage`；`sdcard.img` 由 `genimage` 以 `partition-table-type = "gpt"` 生成，`post-image.sh` **不再**写入 MBR 引导代码或安装 SYSLINUX。整个过程不需要 loop mount、mount 或 root 权限。镜像内 `/usr/bin/caos-ca` 由 Buildroot fakeroot 阶段记录为 `root:root 0755`；构建主机上的 overlay 源文件保留构建用户的属主，这是无 root 构建的正常行为，最终 squashfs 中已验证为 root。
 
 ### 2.4 内核版本选择
 
@@ -142,6 +150,10 @@ Buildroot 2026.08.1 的菜单中“最新版本”是 7.1，但它不是 LTS。�
 - `caos-buildroot/board/caos/linux.fragment`
 - Buildroot 配置：`BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="6.18.55"`
 - 验证文件：`output/build/linux-6.18.55/.config`
+
+UEFI 启动选择基于 Buildroot 2026.08.1 实际提供的组件：其 `boot/grub2` 包提供 `BR2_TARGET_GRUB2_X86_64_EFI`，构建出 GRUB 2.14 的 `bootx64.efi`，并支持通过 `BR2_TARGET_GRUB2_BUILTIN_CONFIG_EFI` 嵌入初始脚本。本配置没有引入 EDK2、systemd-boot 或其他未验证的引导器。
+
+EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假定目标机已有 x86_64 UEFI 固件，直接由固件加载 ESP 上的 `BOOTX64.EFI`。
 
 `CONFIG_NET=n` 不会导致本配置中的任何目标包编译失败。为满足气隙契约，仍主动去除了两类网络用户态内容：
 
@@ -176,7 +188,9 @@ sync
 sudo blockdev --rereadpt /dev/sdX
 ```
 
-镜像使用 BIOS/legacy 引导路径（SYSLINUX MBR + extlinux 配置）。目前未提供 UEFI 启动文件，因此目标机需要启用 legacy/CSM 启动。没有网络启动路径。
+镜像只支持 **x86_64 UEFI**。目标机需要关闭 Legacy/CSM（或设置为 UEFI-only），并从这张 GPT 介质的 ESP 启动。固件应能识别标准可移动介质路径 `\EFI\BOOT\BOOTX64.EFI`；不同厂商固件通常在启动菜单中显示为 `UEFI: <介质名>`，若默认启动顺序没有选中它，请在一次性 Boot Menu 中手工选择，或用固件设置把它加入启动顺序。镜像没有 BIOS、PXE 或网络启动路径。
+
+> 当前 GRUB EFI 应用和内核都**没有做 UEFI Secure Boot 签名**。测试/部署时需在固件中关闭 Secure Boot，或后续自行完成签名与密钥管理；这属于已知限制，不是本镜像已实现的能力。
 
 ---
 
@@ -187,7 +201,7 @@ sudo blockdev --rereadpt /dev/sdX
 默认控制台：
 
 - 串口：`ttyS0`，**115200 8N1**，无流控，vt100；
-- 本地 VGA：`tty1`。
+- 本地 console：`tty1`（由固件/内核提供的 VGA 文本显示；没有本地显示时串口仍是主 console）。
 
 Linux 主机上可使用：
 
@@ -519,8 +533,9 @@ print(f"OK: {n} audit records, tip={prev}")
   - `S10caos-data`：定位 LUKS2 分区、交互解锁、挂载 ext4、`chown caos:caos`、console 引导首次格式化；
   - `S20caos-ca`：创建 `/run/caos-ca`，以 `caos` 用户执行启动前 `caos-ca verify`；未初始化或数据未挂载时只打印指引，不阻塞启动。
 - 没有实现常驻 daemon。`caos-ca` 是手动 CLI；`S20caos-ca` 的职责就是“启动前校验并退出”，与需求中的可选路径一致。
-- `genimage.cfg` 生成混合 MBR/GPT 分区表，GPT 名称提供 `CAOSROOT`/`CAOSDATA` 定位依据；MBR 标识 p1 为 active `0x0c`。
-- MBR 启动代码使用 SYSLINUX 6.03 的 440 字节 `mbr.bin`；FAT 分区通过非特权 mtools 安装器安装 SYSLINUX/extlinux 文件。这个 host-only 工具在 `package/caos-syslinux/` 中从有哈希校验的上游源码 tarball 构建。
+- `genimage.cfg` 只生成标准 GPT（`partition-table-type = "gpt"`），p1 类型为 EFI System Partition；GPT 名称提供 `CAOSROOT`/`CAOSDATA` 定位依据。保护性 MBR 由 GPT 规范要求，只有 `0xEE` 项，没有引导代码或 active 标志。
+- UEFI 启动链：Buildroot 的 GRUB 2.14 `x86_64-efi` 应用 → `\EFI\BOOT\BOOTX64.EFI`；嵌入脚本按 FAT 卷标 `CAOSBOOT` 找到 ESP 并执行 `\EFI\BOOT\grub.cfg`；菜单项用 `linux /zImage ...` 传递完整命令行。`post-image.sh` 只创建 FAT32 ESP 并调用 `genimage`，不写 BIOS MBR 引导代码、不安装 SYSLINUX；genimage 按 GPT 规范生成保护性 MBR。
+- `board/caos/validate-image.py` 独立解析 GPT 头、主/备份分区数组、保护性 MBR、ESP FAT 标签和 CAOSDATA 空白状态，`build.sh` 在 Stage 4 调用它。
 
 ---
 
@@ -533,13 +548,13 @@ print(f"OK: {n} audit records, tip={prev}")
 - Buildroot：tag `2026.08.1`，浅克隆，commit `7fdeadb3`；构建后 Buildroot 源码树 `git status --short --untracked-files=all` 为空，且没有 `buildroot-2026.08.1/output/` 或非空 `dl/`。
 - Rust：`rustc 1.99.1`，target `x86_64-unknown-linux-musl`；Cargo MSRV 声明为 1.88。
 - 内核：Linux 6.18.55（Buildroot 2026.08.1 自带的 6.18 LTS header/hash 系列）。
-- 构建机：x86_64 Linux，24 核；所有下载通过 `BR2_DL_DIR=output/dl` 缓存。
+- 构建机：x86_64 Linux，24 核、约 14 GiB 内存；所有下载通过 `BR2_DL_DIR=output/dl` 缓存。
 
 构建流程实际执行情况：
 
-- 清空 `output/build`、`output/host`、`output/images`、`output/.config` 等构建状态（保留 `output/dl` 下载缓存），并清理 Rust target 后，`./build.sh` 完整执行成功；所有 Buildroot 目标包、`host-gcc` 工具链、内核 6.18.55、squashfs 和镜像均重新编译生成。
-- 之后针对 `post-fakeroot.sh` 做了一个只影响最终 squashfs 文件内容的清理调整（移除 Buildroot 设备表生成的空 `/etc/network/if-*.d` 目录），并用同一个 `./build.sh` 增量重建 rootfs 与 `sdcard.img`；在这次最终重建中 `post-fakeroot.sh` 与 `post-image.sh` 均执行成功。
-- 从空构建输出开始到第一次 Stage 5 成功约 **12 分 20 秒**；最终镜像完成时间约 **14 分钟**（14:48–15:02，24 核，下载缓存已存在）。不含下载的增量重建约 1–2 分钟。
+- 清空 `output/build`、`output/host`、`output/images`、`output/.config` 等全部构建状态（保留 `output/dl` 下载缓存），清理 Rust target 后，以 `JOBS=8 ./build.sh` 重新构建。所有 Buildroot 目标包、工具链、内核 6.18.55、GRUB EFI、squashfs、ESP 和 GPT 镜像均重新生成。
+- 最终 Stage 5 于 `20:36` 成功，`sdcard.img` 生成时间为 `20:36:20`；从 `20:15` 开始计约 **21 分钟**（`JOBS=8`，24 核/14 GiB，下载缓存已存在）。
+- Buildroot 源码树在构建后 `git status --short --untracked-files=all` 为空，没有生成 `buildroot-2026.08.1/output/`。
 - `output/build.log` 的错误扫描：
 
 ```text
@@ -554,32 +569,34 @@ $ grep -E '^ERROR:|^make(\[[0-9]+\])?: \*\*\*|No space left on device' output/bu
 `file target/x86_64-unknown-linux-musl/release/caos-ca`：
 
 ```text
-ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[sha1]=bf9f6fd55ae9d03825d4747a24082889c9eb3a81, stripped
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[sha1]=d99c1c7c8071cdd47a8efa19a22efbcac62af43e, stripped
 ```
 
-- SHA-256：`2e682aea5db2e7c74e816d769edb6e8dfb4bc829a53f25f2a60e7cf7e24c159b`
+- SHA-256：`d64c7e2be0ba202c3f46e41a86318a126e8293e160b886a6d61c6f460af64843`
 - 大小：`2,183,696` bytes（约 2.08 MiB）
 - 权限/属主（最终 squashfs 内）：`root:root`、`0755`
 - 从 `rootfs.squashfs` 提取出的二进制 SHA-256 与 overlay 中完全一致。
 
 `cargo clippy -- -D warnings`：通过。
 `cargo fmt -- --check`：通过。
-`cargo test --release`：通过，11 个单元测试全部成功（包含审计链篡改检测、根密钥封装 round-trip、mlock 缓冲区、序列号规范化和配置校验）。
+`cargo test --release --target x86_64-unknown-linux-musl`：通过，11 个单元测试全部成功（包含审计链篡改检测、根密钥封装 round-trip、mlock 缓冲区、序列号规范化和配置校验）。
 
-### 8.3 内核与网络关闭验证
+### 8.3 内核、网络关闭与 GPT 验证
 
 最终内核配置文件为 `output/build/linux-6.18.55/.config`。实测 grep 结果：
 
 ```text
-$ grep -nE '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES) is not set|CONFIG_(STRICT_KERNEL_RWX|RANDOMIZE_BASE|EFI_PARTITION|DM_CRYPT|SQUASHFS_XZ)=)' \
+$ grep -nE '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set|CONFIG_(PARTITION_ADVANCED|STRICT_KERNEL_RWX|RANDOMIZE_BASE|EFI_PARTITION|DM_CRYPT|SQUASHFS_XZ)=y)' \
     output/build/linux-6.18.55/.config
 471:CONFIG_RANDOMIZE_BASE=y
 853:CONFIG_STRICT_KERNEL_RWX=y
 894:# CONFIG_MODULES is not set
-917:CONFIG_EFI_PARTITION=y
-1061:# CONFIG_NET is not set
-1557:CONFIG_DM_CRYPT=y
-3742:CONFIG_SQUASHFS_XZ=y
+915:CONFIG_PARTITION_ADVANCED=y
+922:# CONFIG_MSDOS_PARTITION is not set
+928:CONFIG_EFI_PARTITION=y
+1074:# CONFIG_NET is not set
+1570:CONFIG_DM_CRYPT=y
+3755:CONFIG_SQUASHFS_XZ=y
 
 $ grep -cE '^CONFIG_(NET|INET|IPV6|PACKET)=' output/build/linux-6.18.55/.config
 0
@@ -587,11 +604,12 @@ $ grep -cE '^CONFIG_(NET|INET|IPV6|PACKET)=' output/build/linux-6.18.55/.config
 
 说明：
 
-- `linux.fragment` 中显式包含需求中的全部八行，包括 `# CONFIG_INET is not set`、`# CONFIG_IPV6 is not set`、`# CONFIG_PACKET is not set`、`CONFIG_STRICT_MODULE_RWX=y` 和 `# CONFIG_MODULES is not set`。
+- `linux.fragment` 中保留全部网络与硬化强制行，包括 `# CONFIG_INET is not set`、`# CONFIG_IPV6 is not set`、`# CONFIG_PACKET is not set`、`CONFIG_STRICT_MODULE_RWX=y` 和 `# CONFIG_MODULES is not set`；并新增 `CONFIG_PARTITION_ADVANCED=y` + `# CONFIG_MSDOS_PARTITION is not set`。`PARTITION_ADVANCED` 只是让默认强制的 DOS/MBR 解析器变为可关闭；其他非 GPT 解析器均保持关闭。
 - 当 `CONFIG_NET=n` 后，Kconfig 会隐藏 `INET`/`IPV6`/`PACKET` 这些依赖项，因此最终 `.config` 中没有它们的行；这是 Kconfig 的正常行为，fragment 中的强制声明已经生效为“网络栈整体不存在”。
 - `CONFIG_MODULES=n` 时 `STRICT_MODULE_RWX` 符号本身被隐藏，最终 `.config` 仅保留 `CONFIG_ARCH_HAS_STRICT_MODULE_RWX=y`；需求强制片段中已经包含 `CONFIG_STRICT_MODULE_RWX=y`。
 - 最终 `.config` 中网络启用符号数量为 0。
-- `CONFIG_EFI_PARTITION=y` 保证 `root=PARTLABEL=CAOSROOT` 能从混合 MBR/GPT 分区表解析分区名。
+- `CONFIG_EFI_PARTITION=y` 保证 `root=PARTLABEL=CAOSROOT` 能从标准 GPT 解析分区名；最终 `.config` 中 **只有** `CONFIG_EFI_PARTITION=y`，`# CONFIG_MSDOS_PARTITION is not set`，镜像不依赖 DOS/MBR 分区解析器。
+- 内核由 GRUB 的 `linux` 命令通过 Linux boot protocol 装载，不需要把 `bzImage` 当作 EFI 可执行文件直接启动；`CONFIG_EFI`/`CONFIG_EFI_STUB` 是 x86_64 defconfig 的既有设置，不是本启动链的额外依赖。
 
 目标 rootfs 额外验证无网络用户态：
 
@@ -606,28 +624,81 @@ $ grep -cE '^CONFIG_(NET|INET|IPV6|PACKET)=' output/build/linux-6.18.55/.config
 
 ```text
 $ ls -l output/images
--rw-r--r-- 1 ...  67108864 Oct 31 15:02 boot.vfat
--rw-r--r-- 1 ...  10261504 Oct 31 15:00 bzImage
--rw-r--r-- 1 ...   6651904 Oct 31 15:02 rootfs.squashfs
--rw-r--r-- 1 ... 336613376 Oct 31 15:02 sdcard.img
+-rw-r--r-- 1 ...  67108864 Oct 31 20:36 boot.vfat
+-rw-r--r-- 1 ...  10261504 Oct 31 20:36 bzImage
+drwxr-xr-x 3 ...      4096 Oct 31 20:32 efi-part
+-rw-r--r-- 1 ...   6651904 Oct 31 20:36 rootfs.squashfs
+-rw-r--r-- 1 ... 336613376 Oct 31 20:36 sdcard.img
+
+$ ls -l output/images/efi-part/EFI/BOOT
+-rw-r--r-- 1 ... 675840 Oct 31 20:32 bootx64.efi
+-rw-r--r-- 1 ...    421 Oct 31 20:36 grub.cfg
 ```
 
 SHA-256：
 
 ```text
-74ee26563890b9a7b87fa63e7333728a6011216f36198b7378574e9546b053ac  output/images/sdcard.img
-387430cd4183ed7573489737af02f2cf1083c08973b0dfe88b4be589673ad035  output/images/rootfs.squashfs
-7be7199874002174c8477db73f19c975fca28507092545a55818943e8d9856be  output/images/boot.vfat
-4dcaefdbb82bc7d62b78d0b11047dbf34eb1cf34b117a07b635335c35b9924d5  output/images/bzImage
-2e682aea5db2e7c74e816d769edb6e8dfb4bc829a53f25f2a60e7cf7e24c159b  caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
+86891931a18262a21e8737bd55159fdc084952888e59f2e0ff989662e902a066  output/images/sdcard.img
+07e1b228518c41eeecacbe3d2a65800203aeecf51f420716d1900064541a949c  output/images/boot.vfat
+0dc37906343aab1c089bef1658ae5d22a3dbab663f8a26cc4ee6961de584d6ef  output/images/rootfs.squashfs
+d976a103a7eee24199757cc4ba99bfa51187a2f0cf83b590903228b0d1982661  output/images/bzImage
+109808670e8d795f627b6c2efda8172e99671ad62c4a496a2d589403cf987cf2  output/images/efi-part/EFI/BOOT/bootx64.efi
+d64c7e2be0ba202c3f46e41a86318a126e8293e160b886a6d61c6f460af64843  caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
 ```
 
-四项必需验收：
+UEFI/GPT 验收：
 
-1. `output/images/sdcard.img` 存在，`336,613,376` bytes（321.02 MiB）。
-2. `output/build/linux-6.18.55/.config` 包含 `# CONFIG_NET is not set`；见 8.3。
-3. `output/images/rootfs.squashfs` 存在，`6,651,904` bytes，squashfs 4.0 / xz / 128 KiB block。
-4. squashfs 内容确认：
+1. **标准 GPT，不是 hybrid。** `sfdisk --json` 返回 `"label": "gpt"`；p1 type 为 `C12A7328-F81F-11D2-BA4B-00A0C93EC93B`（ESP），p2/p3 为 Linux filesystem。
+2. **没有 BIOS 引导代码。** 受保护 MBR 的前 440 字节全为 `00`，4 个 MBR 表项中只有一个 `status=0x00, type=0xee` 的保护项，没有 `0x80` active 标志；boot signature 为 `55aa`。
+3. **ESP 是 FAT32 且路径正确。** 卷标 `CAOSBOOT`，64 MiB；FAT 内文件为：
+
+```text
+::/EFI/
+::/zImage
+::/EFI/BOOT/
+::/EFI/BOOT/BOOTX64.EFI
+::/EFI/BOOT/grub.cfg
+```
+
+4. **GRUB EFI 应用正确。** Buildroot 只选择 `BR2_TARGET_GRUB2_X86_64_EFI=y`，`BR2_TARGET_GRUB2_I386_PC` 未选中；`file` 返回 `PE32+ executable for EFI (application), x86-64`，`objdump -p` 的 `Subsystem` 为 `EFI application`。`BOOTX64.EFI` 内嵌脚本包含：
+
+```text
+search --no-floppy --label CAOSBOOT --set=root
+set prefix=($root)/EFI/BOOT
+configfile ($root)/EFI/BOOT/grub.cfg
+```
+
+5. **ESP 上的启动菜单传参完整。** 内容为：
+
+```text
+set timeout=0
+set default=0
+
+menuentry "CAOS - Air-Gapped Certificate Authority" {
+    linux /zImage console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait
+}
+```
+
+6. **GPT/ESP 校验器通过。** `caos-buildroot/board/caos/validate-image.py` 实测输出：
+
+```text
+image:        output/images/sdcard.img (336613376 bytes)
+table:        GPT (standard protective MBR, no BIOS boot code)
+partition 1: CAOSBOOT type=c12a7328-f81f-11d2-ba4b-00a0c93ec93b start=2048 sectors=131072 (64 MiB)
+partition 2: CAOSROOT type=0fc63daf-8483-4772-8e79-3d69d8477de4 start=133120 sectors=262144 (128 MiB)
+partition 3: CAOSDATA type=0fc63daf-8483-4772-8e79-3d69d8477de4 start=395264 sectors=262144 (128 MiB)
+ESP:          FAT32 label CAOSBOOT, 64 MiB
+rootfs:       squashfs superblock present
+CAOSDATA:     all zero, no LUKS header
+```
+
+   另以 `sgdisk -v` 验证返回 `No problems found`，`sfdisk --verify` 返回无错误；`file -s output/images/boot.vfat` 显示 FAT32、卷标 `CAOSBOOT`、OEM-ID `mkfs.fat`（不是 SYSLINUX）。
+
+7. **p3 仍为空。** `CAOSDATA` 的 `134,217,728` 字节全部为 0，无 LUKS magic、无文件系统，保留首次启动手工 `luksFormat` 的契约。
+8. **GRUB 脚本语法通过。** `grub-script-check` 分别检查 `grub-builtin.cfg` 与 `grub.cfg`，均无输出、退出码 0。
+9. **没有残留 SYSLINUX。** ESP 中不存在 `extlinux`、`ldlinux.sys` 或 `ldlinux.c32`；Buildroot `.config` 中 `BR2_TARGET_SYSLINUX`、`BR2_TARGET_GRUB2_I386_PC` 均未选中。
+
+squashfs 内容确认：
 
 ```text
 $ unsquashfs -l output/images/rootfs.squashfs | grep '/usr/bin/caos-ca$'
@@ -641,44 +712,20 @@ drwx------ 1000/1000          3 ... squashfs-root/mnt/ca-data
 
 （`1000/1000` 即目标系统内的 `caos:caos`；unsquashfs 在宿主机上可能把 1000 显示为宿主用户名。`root:root` 的 0755 二进制通过 `post-fakeroot.sh` 显式记录。）
 
-分区表与引导内容（`sfdisk -d` / FAT 工具实测）：
+squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/caos-ca/config.toml`（root:root 0444）、`/etc/fstab`、`/etc/inittab`、`S10caos-data`、`S20caos-ca`、`blkid`、`findfs`、`mount`、`cryptsetup`、`dmsetup`、`mkfs.ext4`。`/etc/shadow` 为 root:root 0600；`caos` 用户和组为 1000:1000。从 squashfs 提取的 `caos-ca` SHA-256 与 overlay 完全一致。
 
-```text
-GPT name      start sector  size       MBR type
-CAOSBOOT          2048      64 MiB     0x0c (active, bootable)
-CAOSROOT        133120     128 MiB     0x83
-CAOSDATA        395264     128 MiB     0x83
-```
-
-- GPT 分区名称分别为 `CAOSBOOT`、`CAOSROOT`、`CAOSDATA`；
-- MBR p1 `status=0x80`、type `0x0c`，MBR 引导代码与 `output/host/share/caos-syslinux/mbr.bin` 的前 440 字节逐字节相同，boot signature 为 `55aa`；
-- p1 FAT32 卷标 `CAOSBOOT`，包含 `/zImage`、`/extlinux/extlinux.conf`、`ldlinux.sys`、`ldlinux.c32`；
-- p3 分区全部 `134,217,728` 字节为 0，无 LUKS magic、无文件系统，符合“首次启动手工格式化”的交付契约；
-- extlinux 配置为默认 legacy BIOS 启动，内容为：
-
-```text
-DEFAULT caos
-PROMPT 0
-TIMEOUT 20
-
-LABEL caos
-    MENU LABEL CAOS - Air-Gapped Certificate Authority
-    LINUX /zImage
-    APPEND console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait
-```
-
-squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/caos-ca/config.toml`（root:root 0444）、`/etc/fstab`、`/etc/inittab`、`S10caos-data`、`S20caos-ca`、`blkid`、`findfs`、`mount`、`cryptsetup`、`dmsetup`、`mkfs.ext4`。`/etc/shadow` 为 root:root 0600；`caos` 用户和组为 1000:1000。
+> 8.4 是镜像结构、分区表、ESP 内容和脚本语法的静态验收，不是 UEFI 固件实际启动验收。
 
 ### 8.5 功能自测（宿主开发配置）
 
 使用临时配置文件和临时数据目录，对**从最终镜像 squashfs 提取的同一个静态二进制**执行了完整流程：
 
-- `init`：成功生成根/中间 CA、加密根私钥、初始审计记录；
-- `issue --cn final.example --san final.example --san 192.0.2.55`：成功签发带 DNS+IP SAN 的终端证书；`openssl verify -CAfile root-ca.crt -untrusted intermediate-ca.crt leaf.crt` 返回 `OK`；
-- `list`：正确显示 serial、CN、到期时间、active/revoked；
-- `revoke --serial <32hex>`：更新吊销列表并追加审计；重复吊销被拒绝；
-- `verify`：正常时通过；吊销后再次通过；
-- 独立 Python 实现按 `prev_hash,timestamp,action,serial,subject,time_source` 的紧凑 JSON 重算 SHA-256，验证 3 条审计记录的链尾；
+- `init`：成功生成根/中间 CA、加密根私钥、初始审计记录（根序列号 `4ddcaae23908e256fa47781819a7dd14`，中间序列号 `fa63c713f23575e15d42411bb581e37e`）；
+- `issue --cn final-uefi.example --san final-uefi.example --san 192.0.2.55`：成功签发带 DNS+IP SAN 的终端证书，序列号 `118912ef5cde950910a3eb2d1cd10ca8`，到期 `2027-10-31T12:37:15.649172511Z`；`openssl verify -CAfile root-ca.crt -untrusted intermediate-ca.crt leaf.crt` 返回 `OK`；
+- `list`：依次正确显示 `active` 和 `revoked`；
+- `revoke --serial 118912ef5cde950910a3eb2d1cd10ca8`：更新吊销列表并追加审计；重复吊销以 `certificate ... is already revoked` 失败；
+- `verify`：正常时通过；吊销后再次通过，输出 `issued certificates: 1`、`revoked certificates: 1`、`audit entries: 3`、`audit chain: intact`；
+- 独立 Python 实现按 `prev_hash,timestamp,action,serial,subject,time_source` 的紧凑 JSON 重算 SHA-256，验证 3 条审计记录，链尾 `de2f1b4affc6b24e73e2e2ebe67d2d98bf56135936d13223d0de98f0b3f8a1a6`；
 - 中间 CA 私钥与证书公钥哈希一致；`root-ca.key.enc` 中不含明文 `PRIVATE KEY` 字符串。
 
 这些是命令行功能自测，**不是启动测试**；没有运行 QEMU、VirtualBox、Docker 或真机。
@@ -687,7 +734,7 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 
 1. **未做启动测试。** 本轮没有运行 QEMU、VirtualBox、Docker 或真机，因此没有验证引导链、内核启动、init 脚本实际执行、LUKS 交互、字符设备/存储控制器兼容性等。镜像中的配置和内容已静态验证，但首次启动流程必须在目标硬件上验证。
 2. **p3 必须首次手工格式化。** 镜像构建阶段和 `S10caos-data` 都不会自动调用 `luksFormat`。如果不做这一步，系统仍可启动，但没有 CA 数据分区可用。
-3. **BIOS/legacy only。** 当前没有 UEFI 启动文件；需要目标机器启用 legacy/CSM。若目标平台只能 UEFI，需要增加 UEFI 引导方案。
+3. **仅支持 x86_64 UEFI，无 Legacy/CSM 回退。** 目标固件必须从 GPT ESP 启动；本镜像不包含 BIOS 引导代码、SYSLINUX/extlinux 或 hybrid MBR 启动项。UEFI Secure Boot 也没有配置签名，测试/部署时需要在固件中关闭 Secure Boot，或自行完成 GRUB 与内核的签名及密钥管理。部分固件若不自动使用可移动介质默认路径，需要在一次性启动菜单中手工选择 `UEFI: <介质名>`。
 4. **Console root 密码默认空。** 这是 Buildroot 默认行为。由于根文件系统只读，运行时 `passwd` 不能持久保存；生产镜像应在构建时通过 `BR2_TARGET_GENERIC_ROOT_PASSWD` 设置 root hash，或限制物理接触并用机柜锁/受控维护流程。当前镜像的 `/etc/motd` 和 `S20caos-ca` 会打印警告。
 5. **没有常驻服务。** 不提供远程/网络接口；证书操作需要在物理 console 上手动执行。这是气隙设计，但也意味着没有 API/自动化。
 6. **吊销列表是 JSON，不是 X.509 CRL。** 消费方不能直接把 `revoked.json` 当作 PKIX CRL 使用；需要配套的离线分发/集成工具。
@@ -712,7 +759,7 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 - **离线 CRL/OCSP 分发**：生成并签名 X.509 CRL，提供离线介质复制与消费方校验工具。
 - **密钥生命周期自动化**：中间 CA 轮换、证书到期提醒、LUKS key slot 轮换和 header 备份核验。
 - **可复现构建与供应链**：固定 Cargo.lock、Buildroot tag、源码哈希、SBOM、签名镜像与构建环境证明。
-- **更严格的时钟**：加入离线 RTC 漂移审计、启动时人工确认时间、防回拨策略；目前依赖 BIOS RTC 和编译期下限。
+- **更严格的时钟**：加入离线 RTC 漂移审计、启动时人工确认时间、防回拨策略；目前依赖固件 RTC 和编译期下限。
 
 ---
 
@@ -732,14 +779,16 @@ runtime_dir = "/run/caos-ca"
 
 | 现象 | 检查 |
 |---|---|
-| 无法从 SD 卡启动 | 确认 BIOS 为 legacy/CSM 模式；确认 `dd` 写的是整盘而不是分区；检查 `sdcard.img` p1 是否 active |
+| 无法从 SD 卡启动 | 确认固件为 UEFI-only、已关闭 CSM/Secure Boot；确认 `dd` 写的是整盘而不是分区；在 Boot Menu 选择 `UEFI: <介质名>`；检查 p1 是否为 EFI System Partition 且包含 `\EFI\BOOT\BOOTX64.EFI` |
+| 固件报 Secure Boot violation | 本镜像未签名；关闭 Secure Boot，或自行签名 GRUB/内核并管理密钥 |
+| GRUB 找不到 `CAOSBOOT` 或 `grub.cfg` | 重新写盘；用 `validate-image.py` 检查 p1 类型、FAT32 卷标与 `\EFI\BOOT\grub.cfg` 是否存在 |
 | 串口无输出 | 115200 8N1；确认 `console=ttyS0,115200` 生效；检查 ttyS0 电平/适配器 |
 | 启动后没有 `/mnt/ca-data` | 查看 `S10caos-data` console 输出；确认 p3 已 LUKS2 格式化并 ext4 |
-| `caos-ca` 报时钟错误 | RTC 时间早于二进制构建时间；在 BIOS 或 console 设置正确时间后重试 |
+| `caos-ca` 报时钟错误 | RTC 时间早于二进制构建时间；在固件设置或 console 设置正确时间后重试 |
 | `caos-ca verify` 失败 | 先读具体错误；检查 CA 数据、审计链、证书/私钥权限和系统时间；不要继续签发直到修复 |
 | `caos-ca` 报 `mlock` 失败 | 当前 `RLIMIT_MEMLOCK` 太小；在 init/服务环境提高 `ulimit -l`（建议至少 64 KiB） |
 
 ## 附录 C：许可
 
 - `caos-ca`：MIT OR Apache-2.0。
-- 集成树中的脚本与配置：随项目交付；Buildroot、SYSLINUX、BusyBox、util-linux、cryptsetup 等第三方组件遵循各自上游许可。本工程不修改 Buildroot 源码树。
+- 集成树中的脚本与配置：随项目交付；Buildroot、GRUB、BusyBox、util-linux、cryptsetup 等第三方组件遵循各自上游许可。本工程不修改 Buildroot 源码树。

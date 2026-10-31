@@ -14,10 +14,15 @@ CONFIG_RANDOMIZE_BASE=y
 # CONFIG_MODULES is not set
 
 # --- Boot, console and userspace ABI ---------------------------------------
+# Boot is pure x86_64 UEFI through GRUB's EFI application.  The disk is GPT
+# only, so the legacy DOS/MBR partition parser is intentionally not built.
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
+# Enabling PARTITION_ADVANCED is what makes the otherwise forced-on DOS/MBR
+# parser selectable.  Only the GPT parser is enabled below.
+CONFIG_PARTITION_ADVANCED=y
 CONFIG_EFI_PARTITION=y
-CONFIG_MSDOS_PARTITION=y
+# CONFIG_MSDOS_PARTITION is not set
 CONFIG_TMPFS=y
 CONFIG_TMPFS_XATTR=y
 CONFIG_PROC_FS=y

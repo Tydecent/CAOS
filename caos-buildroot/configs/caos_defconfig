@@ -47,6 +47,16 @@ BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_CAOS_PATH)/board/caos/lin
 BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
 BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
 
+# --- UEFI boot loader ------------------------------------------------------
+# Build only the x86_64 EFI GRUB application.  No i386-pc/BIOS GRUB target is
+# selected.  The embedded script locates the FAT ESP by its volume label and
+# loads /EFI/BOOT/grub.cfg from it, so the kernel and its command line can be
+# maintained as an ordinary file on the ESP.
+BR2_TARGET_GRUB2=y
+BR2_TARGET_GRUB2_X86_64_EFI=y
+BR2_TARGET_GRUB2_BUILTIN_MODULES_EFI="boot linux fat part_gpt search search_label configfile normal efi_gop"
+BR2_TARGET_GRUB2_BUILTIN_CONFIG_EFI="$(BR2_EXTERNAL_CAOS_PATH)/board/caos/grub-builtin.cfg"
+
 # --- Target userspace ------------------------------------------------------
 BR2_PACKAGE_BUSYBOX=y
 BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_CAOS_PATH)/board/caos/busybox.fragment"
@@ -65,8 +75,7 @@ BR2_PACKAGE_UTIL_LINUX_MOUNT=y
 # BR2_PACKAGE_WPA_SUPPLICANT is not set
 # BR2_PACKAGE_DHCP is not set
 
-# --- Host tools used to assemble the SD-card image -------------------------
+# --- Host tools used to assemble the GPT/ESP SD-card image -----------------
 BR2_PACKAGE_HOST_GENIMAGE=y
 BR2_PACKAGE_HOST_MTOOLS=y
 BR2_PACKAGE_HOST_DOSFSTOOLS=y
-BR2_PACKAGE_HOST_CAOS_SYSLINUX=y

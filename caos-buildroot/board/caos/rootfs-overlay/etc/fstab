@@ -1,7 +1,7 @@
 # <file system>          <mount pt>  <type>     <options>                                   <dump> <pass>
 #
 # CAOSROOT is already mounted read-only by the kernel using root=PARTLABEL
-# from extlinux.conf.  It is listed here to make the read-only contract
+# from the UEFI GRUB menu entry.  It is listed here to make the read-only contract
 # explicit; noauto avoids a redundant remount during mount -a.
 PARTLABEL=CAOSROOT       /           squashfs   ro,noauto,noatime                           0      0
 

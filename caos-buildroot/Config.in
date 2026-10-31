@@ -1,5 +1,6 @@
-menu "CAOS host utilities"
-
-source "$BR2_EXTERNAL_CAOS_PATH/package/caos-syslinux/Config.in.host"
-
-endmenu
+# CAOS has no BR2_EXTERNAL target or host packages of its own.
+#
+# The UEFI bootloader is Buildroot's GRUB2 EFI package; the kernel, rootfs,
+# ESP and GPT image are configured directly in configs/caos_defconfig and
+# board/caos/.  This file is intentionally kept because BR2_EXTERNAL expects
+# a Config.in entry point.

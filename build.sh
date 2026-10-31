@@ -3,8 +3,8 @@
 # CAOS one-shot build:
 #   1. verify/install the Rust musl target
 #   2. build the static caos-ca binary and install it into the rootfs overlay
-#   3. configure and build the Buildroot image
-#   4. validate the required artifacts and air-gap kernel setting
+#   3. configure and build the Buildroot UEFI/GPT image
+#   4. validate the UEFI ESP, standard GPT layout and air-gap kernel policy
 #
 set -euo pipefail
 
@@ -15,11 +15,19 @@ BR2_EXTERNAL_DIR="$PROJECT_DIR/caos-buildroot"
 RUST_DIR="$PROJECT_DIR/caos-ca"
 OUTPUT_DIR="$PROJECT_DIR/output"
 DOWNLOAD_DIR="$OUTPUT_DIR/dl"
+JOBS="${JOBS:-$(nproc)}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: JOBS must be a positive integer" >&2; exit 1; }
 RUST_TARGET="x86_64-unknown-linux-musl"
 RUST_BINARY="$RUST_DIR/target/$RUST_TARGET/release/caos-ca"
 OVERLAY_BINARY="$BR2_EXTERNAL_DIR/board/caos/rootfs-overlay/usr/bin/caos-ca"
 SDCARD_IMAGE="$OUTPUT_DIR/images/sdcard.img"
+BOOT_IMAGE="$OUTPUT_DIR/images/boot.vfat"
 ROOTFS_IMAGE="$OUTPUT_DIR/images/rootfs.squashfs"
+EFI_IMAGE="$OUTPUT_DIR/images/efi-part/EFI/BOOT/bootx64.efi"
+HOST_MCOPY="$OUTPUT_DIR/host/bin/mcopy"
+HOST_MDIR="$OUTPUT_DIR/host/bin/mdir"
+HOST_GRUB_SCRIPT_CHECK="$OUTPUT_DIR/host/bin/grub-script-check"
+VALIDATOR="$BR2_EXTERNAL_DIR/board/caos/validate-image.py"
 BUILD_LOG="$OUTPUT_DIR/build.log"
 
 log_stage() {
@@ -42,6 +50,7 @@ command -v make >/dev/null 2>&1 || fail "GNU make is required"
 command -v nproc >/dev/null 2>&1 || fail "nproc is required"
 command -v musl-gcc >/dev/null 2>&1 || fail "musl-gcc is required to build ring for x86_64-unknown-linux-musl"
 command -v unsquashfs >/dev/null 2>&1 || fail "unsquashfs is required for rootfs validation"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to validate the GPT/ESP image layout"
 
 if ! rustup target list --installed | grep -qx "$RUST_TARGET"; then
     log_stage "Installing Rust target $RUST_TARGET"
@@ -90,18 +99,76 @@ if [ ! -f "$OUTPUT_DIR/.config" ]; then
 fi
 echo "[CAOS] defconfig complete"
 
-log_stage "Stage 3/5: building Buildroot image (this is the long stage)"
+log_stage "Stage 3/5: building Buildroot image with -j$JOBS (this is the long stage)"
 (
     cd "$BUILDROOT_DIR"
     BR2_DL_DIR="$DOWNLOAD_DIR" \
-        make O="$OUTPUT_DIR" BR2_EXTERNAL="$BR2_EXTERNAL_DIR" -j"$(nproc)" \
+        make O="$OUTPUT_DIR" BR2_EXTERNAL="$BR2_EXTERNAL_DIR" -j"$JOBS" \
         2>&1 | tee "$BUILD_LOG"
 )
 
 log_stage "Stage 4/5: final image checks"
 
 [ -s "$SDCARD_IMAGE" ] || fail "$SDCARD_IMAGE was not generated"
+[ -s "$BOOT_IMAGE" ] || fail "$BOOT_IMAGE was not generated"
 [ -s "$ROOTFS_IMAGE" ] || fail "$ROOTFS_IMAGE was not generated"
+[ -s "$EFI_IMAGE" ] || fail "GRUB EFI application was not generated: $EFI_IMAGE"
+[ -x "$HOST_MCOPY" ] || fail "host mcopy is missing: $HOST_MCOPY"
+[ -x "$HOST_MDIR" ] || fail "host mdir is missing: $HOST_MDIR"
+[ -x "$HOST_GRUB_SCRIPT_CHECK" ] || fail "host grub-script-check is missing: $HOST_GRUB_SCRIPT_CHECK"
+[ -x "$VALIDATOR" ] || fail "image layout validator is missing: $VALIDATOR"
+
+"$HOST_GRUB_SCRIPT_CHECK" "$BR2_EXTERNAL_DIR/board/caos/grub-builtin.cfg"
+"$HOST_GRUB_SCRIPT_CHECK" "$BR2_EXTERNAL_DIR/board/caos/grub.cfg"
+echo "[CAOS] GRUB embedded and ESP scripts parse successfully"
+
+mkdir -p "$OUTPUT_DIR/verification"
+python3 "$VALIDATOR" "$SDCARD_IMAGE" "$BOOT_IMAGE" \
+    | tee "$OUTPUT_DIR/verification/image-layout.txt"
+
+EFI_FILE_OUTPUT="$(file "$EFI_IMAGE")"
+printf '%s\n' "$EFI_FILE_OUTPUT" | grep -q 'PE32+ executable' \
+    || fail "GRUB EFI application is not a PE32+ executable: $EFI_FILE_OUTPUT"
+printf '%s\n' "$EFI_FILE_OUTPUT" | grep -qi 'EFI.*application' \
+    || fail "GRUB EFI application is not identified as an EFI application: $EFI_FILE_OUTPUT"
+# The embedded script must locate the ESP by label and chain-load grub.cfg.
+grep -aFq 'search --no-floppy --label CAOSBOOT --set=root' "$EFI_IMAGE" \
+    || fail "BOOTX64.EFI does not embed the CAOS ESP search script"
+grep -aFq 'configfile ($root)/EFI/BOOT/grub.cfg' "$EFI_IMAGE" \
+    || fail "BOOTX64.EFI does not embed the grub.cfg loader"
+cmp -s "$OUTPUT_DIR/images/efi-part/EFI/BOOT/grub.cfg" \
+    "$BR2_EXTERNAL_DIR/board/caos/grub.cfg" \
+    || fail "output efi-part/EFI/BOOT/grub.cfg is not the CAOS boot menu"
+
+ESP_CHECK_DIR="$OUTPUT_DIR/verification/esp"
+rm -rf "$ESP_CHECK_DIR"
+mkdir -p "$ESP_CHECK_DIR"
+"$HOST_MCOPY" -i "$BOOT_IMAGE" ::/EFI/BOOT/BOOTX64.EFI "$ESP_CHECK_DIR/BOOTX64.EFI" >/dev/null
+"$HOST_MCOPY" -i "$BOOT_IMAGE" ::/EFI/BOOT/grub.cfg "$ESP_CHECK_DIR/grub.cfg" >/dev/null
+"$HOST_MCOPY" -i "$BOOT_IMAGE" ::/zImage "$ESP_CHECK_DIR/zImage" >/dev/null
+cmp -s "$ESP_CHECK_DIR/BOOTX64.EFI" "$EFI_IMAGE" \
+    || fail "ESP BOOTX64.EFI does not match the Buildroot GRUB EFI image"
+cmp -s "$ESP_CHECK_DIR/zImage" "$OUTPUT_DIR/images/bzImage" \
+    || fail "ESP zImage does not match output/images/bzImage"
+
+GRUB_APPEND='linux /zImage console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait'
+grep -Fq "$GRUB_APPEND" "$ESP_CHECK_DIR/grub.cfg" \
+    || fail "ESP grub.cfg does not contain the required CAOS kernel command line"
+cmp -s "$ESP_CHECK_DIR/grub.cfg" "$BR2_EXTERNAL_DIR/board/caos/grub.cfg" \
+    || fail "ESP grub.cfg is not the CAOS boot menu"
+
+"$HOST_MDIR" -i "$BOOT_IMAGE" -b -/ :: >"$OUTPUT_DIR/verification/esp-files.txt"
+if grep -Eiq '(^|/)(extlinux|ldlinux[^/]*|syslinux[^/]*|mbr[^/]*)(/|$)' "$OUTPUT_DIR/verification/esp-files.txt"; then
+    fail "legacy BIOS/SYSLINUX artifacts found on the UEFI ESP"
+fi
+# UEFI removable-media default path, with the kernel and boot menu adjacent.
+grep -q '^::/EFI/BOOT/BOOTX64\.EFI$' "$OUTPUT_DIR/verification/esp-files.txt" \
+    || fail "UEFI default boot file is not at ::/EFI/BOOT/BOOTX64.EFI"
+grep -q '^::/EFI/BOOT/grub\.cfg$' "$OUTPUT_DIR/verification/esp-files.txt" \
+    || fail "GRUB config is not at ::/EFI/BOOT/grub.cfg"
+grep -q '^::/zImage$' "$OUTPUT_DIR/verification/esp-files.txt" \
+    || fail "kernel is not at ::/zImage"
+echo "[CAOS] pure-GPT ESP and UEFI default boot path verified"
 
 KERNEL_CONFIGS=()
 while IFS= read -r -d '' config; do
@@ -119,10 +186,12 @@ grep -qx 'CONFIG_STRICT_KERNEL_RWX=y' "$KERNEL_CONFIG" \
     || fail "$KERNEL_CONFIG does not contain CONFIG_STRICT_KERNEL_RWX=y"
 grep -qx 'CONFIG_RANDOMIZE_BASE=y' "$KERNEL_CONFIG" \
     || fail "$KERNEL_CONFIG does not contain CONFIG_RANDOMIZE_BASE=y"
-# The kernel command line uses root=PARTLABEL=CAOSROOT.
+# The kernel command line uses root=PARTLABEL=CAOSROOT on a GPT-only disk.
 grep -qx 'CONFIG_EFI_PARTITION=y' "$KERNEL_CONFIG" \
     || fail "$KERNEL_CONFIG does not contain CONFIG_EFI_PARTITION=y"
-echo "[CAOS] kernel air-gap policy verified in $KERNEL_CONFIG"
+grep -qx '# CONFIG_MSDOS_PARTITION is not set' "$KERNEL_CONFIG" \
+    || fail "$KERNEL_CONFIG does not contain '# CONFIG_MSDOS_PARTITION is not set'"
+echo "[CAOS] kernel air-gap and GPT-only policy verified in $KERNEL_CONFIG"
 
 UNSQUASH_LIST="$OUTPUT_DIR/unsquashfs-list.txt"
 unsquashfs -l "$ROOTFS_IMAGE" >"$UNSQUASH_LIST"
@@ -167,13 +236,24 @@ for forbidden in sshd curl wget wpa_supplicant ip ifconfig udhcpc route; do
 done
 echo "[CAOS] no forbidden network commands in rootfs"
 
-mkdir -p "$OUTPUT_DIR/verification"
 {
+    echo "boot scheme: UEFI only (GRUB 2 x86_64-efi, standard GPT, ESP CAOSBOOT)"
+    echo "GRUB EFI file(1): $EFI_FILE_OUTPUT"
+    echo
     echo "caos-ca file(1): $FILE_OUTPUT"
     echo
     echo "kernel config: $KERNEL_CONFIG"
-    grep -E '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES) is not set|CONFIG_(STRICT_KERNEL_RWX|STRICT_MODULE_RWX|RANDOMIZE_BASE)=y)$' \
+    grep -E '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set|CONFIG_(STRICT_KERNEL_RWX|STRICT_MODULE_RWX|RANDOMIZE_BASE|EFI_PARTITION)=y)$' \
         "$KERNEL_CONFIG" || true
+    echo
+    echo "GPT/ESP layout validation:"
+    cat "$OUTPUT_DIR/verification/image-layout.txt"
+    echo
+    echo "ESP directory listing:"
+    cat "$OUTPUT_DIR/verification/esp-files.txt"
+    echo
+    echo "ESP grub.cfg:"
+    cat "$ESP_CHECK_DIR/grub.cfg"
     echo
     echo "rootfs.squashfs caos-ca listing:"
     unsquashfs -ll "$ROOTFS_IMAGE" | grep -E '/usr/bin/caos-ca$' || true
@@ -190,4 +270,4 @@ echo
 echo "[CAOS] artifact verification summary: $OUTPUT_DIR/verification/summary.txt"
 echo "[CAOS] Buildroot log: $BUILD_LOG"
 echo "[CAOS] sdcard image ready: $SDCARD_IMAGE"
-echo "[CAOS] No boot test was performed."
+echo "[CAOS] No UEFI boot test was performed; image contents were validated statically."
