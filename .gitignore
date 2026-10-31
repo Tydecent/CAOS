@@ -4,6 +4,9 @@
 # Rust build artifacts
 /caos-ca/target/
 
+# Python bytecode
+__pycache__/
+
 # Generated Rust binary copied into the rootfs overlay by build.sh
 /caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
 

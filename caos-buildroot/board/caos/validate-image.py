@@ -151,10 +151,9 @@ def validate_mbr(blob: bytes) -> None:
         fail("protective MBR entry does not start at LBA 1")
 
 
-def validate_vfat(path: Path) -> None:
-    data = path.read_bytes()
+def validate_vfat_data(data: bytes, source: str) -> None:
     if len(data) < SECTOR:
-        fail(f"ESP is too small: {path}")
+        fail(f"ESP is too small: {source}")
     if data[510:512] != b"\x55\xaa":
         fail("ESP FAT boot sector signature is missing")
     if struct.unpack_from("<H", data, 11)[0] != SECTOR:
@@ -168,6 +167,26 @@ def validate_vfat(path: Path) -> None:
         fail(f"ESP FAT label is {label!r}, expected 'CAOSBOOT'")
     if len(data) != 64 * MIB:
         fail(f"ESP image is {len(data)} bytes, expected {64 * MIB}")
+
+
+def validate_vfat(path: Path) -> None:
+    data = path.read_bytes()
+    validate_vfat_data(data, str(path))
+
+
+def validate_esp_partition(blob: bytes, partitions: list[dict[str, object]], vfat_path: Path) -> None:
+    boot = partitions[0]
+    esp_offset = int(boot["first_lba"]) * SECTOR
+    esp_size = int(boot["sectors"]) * SECTOR
+    esp_data = blob[esp_offset : esp_offset + esp_size]
+    if len(esp_data) != esp_size:
+        fail("CAOSBOOT partition reaches beyond the end of the image")
+
+    validate_vfat_data(esp_data, "sdcard.img:CAOSBOOT")
+
+    vfat_data = vfat_path.read_bytes()
+    if vfat_data != esp_data:
+        fail("CAOSBOOT partition in sdcard.img does not match the boot.vfat image")
 
 
 def main() -> None:
@@ -241,6 +260,7 @@ def main() -> None:
         if blob[offset : min(offset + chunk, data_end)].strip(b"\0"):
             fail("CAOSDATA is not blank; it must ship unformatted for first-boot LUKS2")
 
+    validate_esp_partition(blob, partitions, vfat_path)
     validate_vfat(vfat_path)
 
     print(f"image:        {image_path} ({len(blob)} bytes)")

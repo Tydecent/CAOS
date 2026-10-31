@@ -143,6 +143,12 @@ cmp -s "$OUTPUT_DIR/images/efi-part/EFI/BOOT/grub.cfg" \
 ESP_CHECK_DIR="$OUTPUT_DIR/verification/esp"
 rm -rf "$ESP_CHECK_DIR"
 mkdir -p "$ESP_CHECK_DIR"
+# Validate the actual ESP embedded in the final image, not just the standalone
+# boot.vfat that is used as a convenience input during image assembly.
+dd if="$SDCARD_IMAGE" of="$ESP_CHECK_DIR/disk-esp.raw" bs=512 skip=2048 count=131072 status=none
+cmp -s "$ESP_CHECK_DIR/disk-esp.raw" "$BOOT_IMAGE" \
+    || fail "CAOSBOOT partition in sdcard.img does not match boot.vfat"
+
 "$HOST_MCOPY" -i "$BOOT_IMAGE" ::/EFI/BOOT/BOOTX64.EFI "$ESP_CHECK_DIR/BOOTX64.EFI" >/dev/null
 "$HOST_MCOPY" -i "$BOOT_IMAGE" ::/EFI/BOOT/grub.cfg "$ESP_CHECK_DIR/grub.cfg" >/dev/null
 "$HOST_MCOPY" -i "$BOOT_IMAGE" ::/zImage "$ESP_CHECK_DIR/zImage" >/dev/null
