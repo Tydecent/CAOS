@@ -1,0 +1,5 @@
+menu "CAOS host utilities"
+
+source "$BR2_EXTERNAL_CAOS_PATH/package/caos-syslinux/Config.in.host"
+
+endmenu

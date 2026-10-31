@@ -1,0 +1,191 @@
+#!/bin/sh
+#
+# Open and mount the encrypted CAOSDATA partition.
+#
+# The partition is deliberately NOT formatted during image build.  This script
+# never formats it either: it detects an unformatted or unencrypted partition,
+# prints the first-boot commands, and lets the operator decide.
+#
+# Run as root by BusyBox init.
+
+set -u
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/sbin:/usr/local/bin
+
+DATA_MOUNT=/mnt/ca-data
+MAPPER=caos-data
+MAPPER_DEV=/dev/mapper/$MAPPER
+
+log() {
+    echo "CAOS[data]: $*"
+}
+
+# Locate util-linux binaries explicitly where possible.  The image contains
+# both BusyBox applets and util-linux; the latter are preferred for blkid and
+# findfs because the CAOSDATA GPT partition label is resolved there.
+BLKID=
+FINDFS=
+for candidate in /usr/sbin/blkid /sbin/blkid /usr/bin/blkid /bin/blkid; do
+    if [ -x "$candidate" ]; then
+        BLKID=$candidate
+        break
+    fi
+done
+for candidate in /usr/sbin/findfs /sbin/findfs /usr/bin/findfs /bin/findfs; do
+    if [ -x "$candidate" ]; then
+        FINDFS=$candidate
+        break
+    fi
+done
+
+ensure_device_mapper_control() {
+    # Device-mapper's control node is traditionally created by udev.  This
+    # image has only devtmpfs.  The kernel may already expose the misc device
+    # through devtmpfs; if not, create the stable 10:236 control node so both
+    # cryptsetup and later manual first-boot commands can talk to the driver.
+    [ -e /dev/mapper/control ] && return 0
+    mkdir -p /dev/mapper
+    if command -v dmsetup >/dev/null 2>&1; then
+        dmsetup version >/dev/null 2>&1 || true
+    fi
+    if [ ! -e /dev/mapper/control ]; then
+        mknod /dev/mapper/control c 10 236 >/dev/null 2>&1 || true
+        chmod 0600 /dev/mapper/control 2>/dev/null || true
+    fi
+}
+
+locate_data_partition() {
+    part=
+
+    # Normal lookup: the LUKS2 header carries the label CAOSDATA.
+    if [ -n "$BLKID" ]; then
+        part=$("$BLKID" -L CAOSDATA 2>/dev/null || true)
+    fi
+    [ -n "$part" ] && { echo "$part"; return 0; }
+
+    # First boot: the partition has no filesystem/LUKS label yet, but genimage
+    # gives the GPT partition entry the name CAOSDATA.
+    if [ -n "$FINDFS" ]; then
+        part=$("$FINDFS" PARTLABEL=CAOSDATA 2>/dev/null || true)
+    fi
+    [ -n "$part" ] && { echo "$part"; return 0; }
+
+    # Last resort for systems whose partition table tooling dropped the GPT
+    # name: derive partition 3 from the partition that carries the rootfs.
+    root_source=$(awk '$2 == "/" { print $1; exit }' /proc/mounts 2>/dev/null || true)
+    case "$root_source" in
+        /dev/mmcblk*p2|/dev/nvme*n*p2|/dev/loop*p2)
+            candidate="${root_source%2}3"
+            ;;
+        /dev/sd*2|/dev/vd*2|/dev/hd*2)
+            candidate="${root_source%2}3"
+            ;;
+        *)
+            candidate=
+            ;;
+    esac
+    if [ -n "$candidate" ] && [ -b "$candidate" ]; then
+        echo "$candidate"
+        return 0
+    fi
+    return 1
+}
+
+print_format_instructions() {
+    part=$1
+    log "CAOSDATA at $part is not LUKS2-formatted yet."
+    log "The image intentionally ships an empty partition. On this console,"
+    log "as root, run these commands once (choose a strong LUKS passphrase):"
+    log ""
+    log "  cryptsetup luksFormat --type luks2 --label CAOSDATA $part"
+    log "  cryptsetup luksOpen $part $MAPPER"
+    log "  dmsetup mknodes"
+    log "  mkfs.ext4 -L CAOS-DATA $MAPPER_DEV"
+    log "  cryptsetup close $MAPPER"
+    log "  reboot"
+    log ""
+    log "Back up the LUKS header offline after formatting; without it the"
+    log "passphrase alone cannot recover CA data."
+}
+
+print_filesystem_instructions() {
+    log "LUKS container opened, but it does not contain a usable ext4 filesystem."
+    log "As root, format the mapper once, then reboot:"
+    log ""
+    log "  mkfs.ext4 -L CAOS-DATA $MAPPER_DEV"
+    log "  cryptsetup close $MAPPER"
+    log "  reboot"
+}
+
+if [ ! -d "$DATA_MOUNT" ]; then
+    mkdir -p "$DATA_MOUNT"
+fi
+
+ensure_device_mapper_control
+
+if grep -q " $DATA_MOUNT " /proc/mounts 2>/dev/null; then
+    chown caos:caos "$DATA_MOUNT"
+    chmod 0700 "$DATA_MOUNT"
+    log "$DATA_MOUNT is already mounted."
+    exit 0
+fi
+
+if ! partition=$(locate_data_partition); then
+    log "could not locate the CAOSDATA partition."
+    log "Expected GPT partition label CAOSDATA (partition 3)."
+    if [ -n "$BLKID" ]; then
+        "$BLKID" 2>/dev/null | sed 's/^/CAOS[data]:   /' || true
+    fi
+    log "Boot continues without CA data; run caos-ca on a formatted data partition."
+    exit 0
+fi
+
+if ! command -v cryptsetup >/dev/null 2>&1; then
+    log "cryptsetup is missing from the image; cannot open CAOSDATA."
+    exit 0
+fi
+
+if ! cryptsetup isLuks "$partition" >/dev/null 2>&1; then
+    print_format_instructions "$partition"
+    exit 0
+fi
+
+if [ ! -e "$MAPPER_DEV" ]; then
+    log "opening LUKS2 container on $partition (passphrase prompt follows)."
+    if ! cryptsetup luksOpen "$partition" "$MAPPER"; then
+        log "could not open CAOSDATA; boot continues without CA data."
+        exit 0
+    fi
+    # /dev/mapper/<name> convenience symlinks are normally made by udev.
+    # The image uses devtmpfs only, so ask libdevmapper to rebuild the nodes.
+    if command -v dmsetup >/dev/null 2>&1; then
+        dmsetup mknodes >/dev/null 2>&1 || true
+    fi
+    if [ ! -b "$MAPPER_DEV" ]; then
+        for sysdev in /sys/block/dm-*; do
+            [ -r "$sysdev/dm/name" ] || continue
+            if [ "$(cat "$sysdev/dm/name" 2>/dev/null)" = "$MAPPER" ]; then
+                candidate="/dev/${sysdev##*/}"
+                if [ -b "$candidate" ]; then
+                    MAPPER_DEV=$candidate
+                    break
+                fi
+            fi
+        done
+    fi
+    if [ ! -b "$MAPPER_DEV" ]; then
+        log "LUKS mapping opened but no mapper block device became available."
+        cryptsetup close "$MAPPER" >/dev/null 2>&1 || true
+        exit 0
+    fi
+fi
+
+if ! mount -t ext4 -o rw,nodev,nosuid,noexec "$MAPPER_DEV" "$DATA_MOUNT"; then
+    print_filesystem_instructions
+    cryptsetup close "$MAPPER" >/dev/null 2>&1 || true
+    exit 0
+fi
+
+chown caos:caos "$DATA_MOUNT"
+chmod 0700 "$DATA_MOUNT"
+log "mounted encrypted CA data at $DATA_MOUNT."
+exit 0

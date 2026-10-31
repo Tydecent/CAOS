@@ -1,0 +1,23 @@
+CAOS - Air-Gapped Certificate Authority
+=======================================
+
+The root filesystem is read-only.  CA data lives on the encrypted CAOSDATA
+partition under /mnt/ca-data and is opened by S10caos-data at boot.
+
+CAOSDATA must be LUKS2-formatted once on first boot; S10caos-data prints the
+exact commands if the partition is still empty or unformatted.  The image
+itself deliberately contains no LUKS header and no CA private keys.
+
+The CA tools run as the unprivileged "caos" user:
+  su -s /bin/sh caos
+  caos-ca init
+  caos-ca issue --cn host.example --san host.example
+
+The S20caos-ca init script performs a startup integrity check with
+"caos-ca verify" when the CA has been initialized.  It does not start a
+daemon; issue, list, revoke and verify are run manually as described above.
+
+WARNING: this image uses the Buildroot default of an empty root password on
+the local console.  Keep the machine physically controlled.  For production,
+rebuild with a root password, or apply the console-access controls described
+in the project README.

@@ -1,0 +1,1 @@
+caos 1000 caos 1000 * /mnt/ca-data /bin/sh - CAOS CA operator

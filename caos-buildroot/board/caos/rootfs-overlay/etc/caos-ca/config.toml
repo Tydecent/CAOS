@@ -1,0 +1,7 @@
+# Read-only CAOS configuration.
+#
+# This file lives on the read-only squashfs root and is packaged as 0444.
+# The Rust program reads it only; it never writes configuration.
+ca_name = "CAOS"
+data_dir = "/mnt/ca-data"
+runtime_dir = "/run/caos-ca"

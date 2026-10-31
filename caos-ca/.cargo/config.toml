@@ -1,0 +1,19 @@
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+# +crt-static is the required musl target setting.  relocation-model=static
+# keeps the produced ELF a classic static executable instead of a static PIE,
+# which is also what `file` reports as "statically linked".
+rustflags = [
+    "-C",
+    "target-feature=+crt-static",
+    "-C",
+    "relocation-model=static",
+]
+
+[env]
+# ring contains C and assembly.  Compile that C with the musl C compiler so it
+# uses musl headers and cannot accidentally link against the host glibc.
+CC_x86_64_unknown_linux_musl = "musl-gcc"
+AR_x86_64_unknown_linux_musl = "ar"

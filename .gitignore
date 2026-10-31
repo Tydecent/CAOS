@@ -1,0 +1,15 @@
+# Buildroot output and download cache
+/output/
+
+# Rust build artifacts
+/caos-ca/target/
+
+# Generated Rust binary copied into the rootfs overlay by build.sh
+/caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
+
+# Local editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

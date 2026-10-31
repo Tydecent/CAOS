@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+# CAOS CA preflight.
+#
+# This is NOT a daemon: caos-ca is intentionally a command-line tool that runs
+# as the unprivileged caos user.  At boot we create the tmpfs runtime directory
+# and, when the encrypted data partition is mounted and the CA has been
+# initialized, we run the full read-only integrity verification as caos.
+# Daily issue/list/revoke/verify operations are executed manually by the
+# operator (see the project README).
+
+set -u
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+RUNDIR=/run/caos-ca
+DATA_MOUNT=/mnt/ca-data
+CAOS_CA=/usr/bin/caos-ca
+CONFIG=/etc/caos-ca/config.toml
+VERIFY_LOG=$RUNDIR/boot-verify.log
+
+mkdir -p "$RUNDIR"
+chown caos:caos "$RUNDIR"
+chmod 0700 "$RUNDIR"
+
+if grep -q '^root::' /etc/shadow 2>/dev/null; then
+    echo "CAOS: WARNING: the root console account has an empty password."
+    echo "CAOS:          restrict physical access; set a root password at build time."
+fi
+
+if ! grep -q " $DATA_MOUNT " /proc/mounts 2>/dev/null; then
+    echo "CAOS: encrypted CA data is not mounted; skipping CA verification."
+    echo "CAOS: see /etc/init.d/S10caos-data output and the README first-boot steps."
+    exit 0
+fi
+
+if [ ! -x "$CAOS_CA" ]; then
+    echo "CAOS: $CAOS_CA is missing from the image."
+    exit 0
+fi
+
+if [ ! -f "$DATA_MOUNT/db/metadata.json" ]; then
+    echo "CAOS: CA has not been initialized on this data partition."
+    echo "CAOS: log in as root, then run:"
+    echo "CAOS:   su -s /bin/sh caos"
+    echo "CAOS:   caos-ca init"
+    exit 0
+fi
+
+if su -s /bin/sh -c "$CAOS_CA --config $CONFIG verify" caos >"$VERIFY_LOG" 2>&1; then
+    echo "CAOS: startup integrity verification succeeded."
+    echo "CAOS: operational commands are manual; use: su -s /bin/sh caos"
+else
+    echo "CAOS: WARNING: startup integrity verification FAILED."
+    echo "CAOS: details: $VERIFY_LOG"
+    if [ -r "$VERIFY_LOG" ]; then
+        sed 's/^/CAOS:   /' "$VERIFY_LOG" | head -n 20
+    fi
+    echo "CAOS: do not issue certificates until this is investigated."
+fi
+
+exit 0
