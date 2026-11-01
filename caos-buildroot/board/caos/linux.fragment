@@ -33,6 +33,16 @@ CONFIG_SERIAL_8250_CONSOLE=y
 CONFIG_VT=y
 CONFIG_VGA_CONSOLE=y
 CONFIG_DUMMY_CONSOLE=y
+# UEFI systems expose a GOP framebuffer, not VGA text mode.  Provide a DRM
+# fbdev console so kernel messages and tty1 are visible on real hardware.
+# simpledrm handles firmware framebuffers when no dedicated GPU driver binds;
+# DRM_FBDEV_EMULATION keeps the console when i915 (or another DRM driver) takes
+# over.  fbcon is what actually renders tty0/tty1.
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
 CONFIG_BINFMT_ELF=y
 CONFIG_BINFMT_SCRIPT=y
 CONFIG_RTC_CLASS=y

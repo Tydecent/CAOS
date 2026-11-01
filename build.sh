@@ -197,7 +197,19 @@ grep -qx 'CONFIG_EFI_PARTITION=y' "$KERNEL_CONFIG" \
     || fail "$KERNEL_CONFIG does not contain CONFIG_EFI_PARTITION=y"
 grep -qx '# CONFIG_MSDOS_PARTITION is not set' "$KERNEL_CONFIG" \
     || fail "$KERNEL_CONFIG does not contain '# CONFIG_MSDOS_PARTITION is not set'"
-echo "[CAOS] kernel air-gap and GPT-only policy verified in $KERNEL_CONFIG"
+# UEFI provides a GOP framebuffer, not VGA text mode.  Without fbcon the kernel
+# runs but the screen stays on GRUB's last line.  Keep a DRM fbdev console.
+for option in \
+    CONFIG_DRM_FBDEV_EMULATION=y \
+    CONFIG_DRM_SIMPLEDRM=y \
+    CONFIG_SYSFB_SIMPLEFB=y \
+    CONFIG_FRAMEBUFFER_CONSOLE=y \
+    CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
+do
+    grep -qx "$option" "$KERNEL_CONFIG" \
+        || fail "$KERNEL_CONFIG does not contain $option"
+done
+echo "[CAOS] kernel air-gap, GPT-only and UEFI fbcon policy verified in $KERNEL_CONFIG"
 
 UNSQUASH_LIST="$OUTPUT_DIR/unsquashfs-list.txt"
 unsquashfs -l "$ROOTFS_IMAGE" >"$UNSQUASH_LIST"
@@ -249,7 +261,7 @@ echo "[CAOS] no forbidden network commands in rootfs"
     echo "caos-ca file(1): $FILE_OUTPUT"
     echo
     echo "kernel config: $KERNEL_CONFIG"
-    grep -E '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set|CONFIG_(STRICT_KERNEL_RWX|STRICT_MODULE_RWX|RANDOMIZE_BASE|EFI_PARTITION)=y)$' \
+    grep -E '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set|CONFIG_(STRICT_KERNEL_RWX|STRICT_MODULE_RWX|RANDOMIZE_BASE|EFI_PARTITION|DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFFER_CONSOLE|FRAMEBUFFER_CONSOLE_DETECT_PRIMARY)=y)$' \
         "$KERNEL_CONFIG" || true
     echo
     echo "GPT/ESP layout validation:"
@@ -276,4 +288,4 @@ echo
 echo "[CAOS] artifact verification summary: $OUTPUT_DIR/verification/summary.txt"
 echo "[CAOS] Buildroot log: $BUILD_LOG"
 echo "[CAOS] sdcard image ready: $SDCARD_IMAGE"
-echo "[CAOS] No UEFI boot test was performed; image contents were validated statically."
+echo "[CAOS] image contents validated; UEFI boot verification is a separate QEMU/real-hardware step."

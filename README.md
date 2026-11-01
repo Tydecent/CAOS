@@ -5,7 +5,7 @@ CAOS 是一个可烧录到 x86_64 机器（SD 卡 / USB / 磁盘）的气隙证�
 - `caos-ca`：使用 Rust 编写的命令行 CA 工具，提供根 CA / 中间 CA 初始化、终端证书签发、列表、吊销与完整性校验。最终产物是静态链接的 `x86_64-unknown-linux-musl` ELF。
 - Buildroot 镜像：64 MiB FAT32 EFI System Partition（ESP）+ 只读 squashfs 根文件系统 + 预留的 LUKS2 数据分区；标准 GPT、纯 x86_64 UEFI（GRUB EFI）启动，不支持 Legacy BIOS/CSM。内核关闭整个网络栈，rootfs 不含网络客户端或远程登录服务。
 
-> **重要：本轮没有进行 QEMU 或真机启动测试。** 本文档描述的是已实际构建、静态检查和镜像内容验证的结果，不是启动验收报告。首次启动流程仍需在目标硬件上验证。第 9 节列出了所有已知限制。
+> **验证范围：本镜像已在 QEMU/OVMF 中完成 UEFI 启动验证**，串口和图形 console 均到达 `caos login:`；**尚未在真实目标硬件上启动**。第 8.5 节记录 QEMU 启动证据，第 9 节列出真机仍需确认的限制。
 
 ---
 
@@ -201,7 +201,7 @@ sudo blockdev --rereadpt /dev/sdX
 默认控制台：
 
 - 串口：`ttyS0`，**115200 8N1**，无流控，vt100；
-- 本地 console：`tty1`（由固件/内核提供的 VGA 文本显示；没有本地显示时串口仍是主 console）。
+- 本地 console：`tty1`，通过内核 DRM/fbdev framebuffer console 显示（UEFI GOP framebuffer；没有本地显示时串口仍是主 console）。
 
 Linux 主机上可使用：
 
@@ -552,9 +552,9 @@ print(f"OK: {n} audit records, tip={prev}")
 
 构建流程实际执行情况：
 
-- 清空 `output/build`、`output/host`、`output/images`、`output/.config` 等全部构建状态（保留 `output/dl` 下载缓存），清理 Rust target 后，以 `JOBS=8 ./build.sh` 重新构建。所有 Buildroot 目标包、工具链、内核 6.18.55、GRUB EFI、squashfs、ESP 和 GPT 镜像均重新生成。
-- 最终 Stage 5 于 `20:36` 成功，`sdcard.img` 生成时间为 `20:36:20`；从 `20:15` 开始计约 **21 分钟**（`JOBS=8`，24 核/14 GiB，下载缓存已存在）。
-- Buildroot 源码树在构建后 `git status --short --untracked-files=all` 为空，没有生成 `buildroot-2026.08.1/output/`。
+- 首次迁移构建清空 `output/build`、`output/host`、`output/images`、`output/.config` 等全部构建状态（保留 `output/dl` 下载缓存），清理 Rust target 后，以 `JOBS=8 ./build.sh` 重新构建；Stage 5 于 `20:36` 成功。
+- 修复 UEFI framebuffer console 时，在 `linux.fragment` 增加 `DRM_FBDEV_EMULATION`/`simpledrm`/`fbcon` 后，以 `JOBS=8 ./build.sh` 增量重建；内核和镜像于 `20:49` 重新生成，Rust/工具链/GRUB 复用已构建结果。
+- 两次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
 - `output/build.log` 的错误扫描：
 
 ```text
@@ -600,6 +600,15 @@ $ grep -nE '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set
 
 $ grep -cE '^CONFIG_(NET|INET|IPV6|PACKET)=' output/build/linux-6.18.55/.config
 0
+
+$ grep -nE '^(CONFIG_(DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFFER_CONSOLE|FRAMEBUFFER_CONSOLE_DETECT_PRIMARY)=y|# CONFIG_FB is not set)' \
+    output/build/linux-6.18.55/.config
+1240:CONFIG_SYSFB_SIMPLEFB=y
+2472:CONFIG_DRM_FBDEV_EMULATION=y
+2495:CONFIG_DRM_SIMPLEDRM=y
+2564:# CONFIG_FB is not set
+2610:CONFIG_FRAMEBUFFER_CONSOLE=y
+2612:CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
 ```
 
 说明：
@@ -608,6 +617,7 @@ $ grep -cE '^CONFIG_(NET|INET|IPV6|PACKET)=' output/build/linux-6.18.55/.config
 - 当 `CONFIG_NET=n` 后，Kconfig 会隐藏 `INET`/`IPV6`/`PACKET` 这些依赖项，因此最终 `.config` 中没有它们的行；这是 Kconfig 的正常行为，fragment 中的强制声明已经生效为“网络栈整体不存在”。
 - `CONFIG_MODULES=n` 时 `STRICT_MODULE_RWX` 符号本身被隐藏，最终 `.config` 仅保留 `CONFIG_ARCH_HAS_STRICT_MODULE_RWX=y`；需求强制片段中已经包含 `CONFIG_STRICT_MODULE_RWX=y`。
 - 最终 `.config` 中网络启用符号数量为 0。
+- 显示控制台不再依赖传统 VGA 文本模式。UEFI 只提供 GOP framebuffer，因此启用 `CONFIG_DRM_FBDEV_EMULATION=y`、`CONFIG_DRM_SIMPLEDRM=y`、`CONFIG_SYSFB_SIMPLEFB=y`、`CONFIG_FRAMEBUFFER_CONSOLE=y` 和 `CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y`；`CONFIG_FB` 仍为 `n`，由 DRM fbdev 提供 `fb0`/`fbcon`。
 - `CONFIG_EFI_PARTITION=y` 保证 `root=PARTLABEL=CAOSROOT` 能从标准 GPT 解析分区名；最终 `.config` 中 **只有** `CONFIG_EFI_PARTITION=y`，`# CONFIG_MSDOS_PARTITION is not set`，镜像不依赖 DOS/MBR 分区解析器。
 - 内核由 GRUB 的 `linux` 命令通过 Linux boot protocol 装载，不需要把 `bzImage` 当作 EFI 可执行文件直接启动；`CONFIG_EFI`/`CONFIG_EFI_STUB` 是 x86_64 defconfig 的既有设置，不是本启动链的额外依赖。
 
@@ -624,24 +634,24 @@ $ grep -cE '^CONFIG_(NET|INET|IPV6|PACKET)=' output/build/linux-6.18.55/.config
 
 ```text
 $ ls -l output/images
--rw-r--r-- 1 ...  67108864 Oct 31 20:36 boot.vfat
--rw-r--r-- 1 ...  10261504 Oct 31 20:36 bzImage
+-rw-r--r-- 1 ...  67108864 Nov  1 20:49 boot.vfat
+-rw-r--r-- 1 ...  10343424 Nov  1 20:49 bzImage
 drwxr-xr-x 3 ...      4096 Oct 31 20:32 efi-part
--rw-r--r-- 1 ...   6651904 Oct 31 20:36 rootfs.squashfs
--rw-r--r-- 1 ... 336613376 Oct 31 20:36 sdcard.img
+-rw-r--r-- 1 ...   6651904 Nov  1 20:49 rootfs.squashfs
+-rw-r--r-- 1 ... 336613376 Nov  1 20:49 sdcard.img
 
 $ ls -l output/images/efi-part/EFI/BOOT
 -rw-r--r-- 1 ... 675840 Oct 31 20:32 bootx64.efi
--rw-r--r-- 1 ...    421 Oct 31 20:36 grub.cfg
+-rw-r--r-- 1 ...    421 Nov  1 20:49 grub.cfg
 ```
 
 SHA-256：
 
 ```text
-86891931a18262a21e8737bd55159fdc084952888e59f2e0ff989662e902a066  output/images/sdcard.img
-07e1b228518c41eeecacbe3d2a65800203aeecf51f420716d1900064541a949c  output/images/boot.vfat
-0dc37906343aab1c089bef1658ae5d22a3dbab663f8a26cc4ee6961de584d6ef  output/images/rootfs.squashfs
-d976a103a7eee24199757cc4ba99bfa51187a2f0cf83b590903228b0d1982661  output/images/bzImage
+39cbc95db515bd379c2d0d5b6e1124abc3016dabc961d9f30dc615e6e16d7871  output/images/sdcard.img
+02227965e79ab6125f6d2c375972889909fb9d99ce88100af18f261f76c8fa52  output/images/boot.vfat
+0adbc062b419e4b68878a7416614d11c8cc97fe0c5ca64a3005c48b9331ed086  output/images/rootfs.squashfs
+58fa4a04bc4ce2d5f98f51b73141ce1e68e97fc1c2eac66cca8110d2804c468c  output/images/bzImage
 109808670e8d795f627b6c2efda8172e99671ad62c4a496a2d589403cf987cf2  output/images/efi-part/EFI/BOOT/bootx64.efi
 d64c7e2be0ba202c3f46e41a86318a126e8293e160b886a6d61c6f460af64843  caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
 ```
@@ -716,7 +726,33 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 
 > 8.4 是镜像结构、分区表、ESP 内容和脚本语法的静态验收，不是 UEFI 固件实际启动验收。
 
-### 8.5 功能自测（宿主开发配置）
+### 8.5 QEMU UEFI 启动验证
+
+使用宿主机 QEMU 10.2.1 + OVMF（edk2 `2025.11-3ubuntu7.3`）对最终 `sdcard.img` 做了多次纯 UEFI 启动：
+
+1. 将镜像作为 `qemu-xhci` 下的 `usb-storage` 设备，串口输出到文件，确认内核、USB 枚举、`PARTLABEL=CAOSROOT` 根挂载和 init 全流程；
+2. 关闭串口（`-serial none`），仅保留图形 framebuffer，确认本地屏幕能显示内核日志和 `caos login:`；再用 QEMU `sendkey` 从本地 console 输入 `root`，成功进入 root shell，证明 `tty1`/键盘输入链路也正常。
+
+关键日志：
+
+```text
+[    0.865898] [drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0
+[    0.897930] Console: switching to colour frame buffer device 160x50
+[    0.903948] simple-framebuffer simple-framebuffer.0: [drm] fb0: simpledrmdrmfb frame buffer device
+[    2.283056] VFS: Mounted root (squashfs filesystem) readonly on device 8:2.
+[    2.433835] Run /sbin/init as init process
+caos login:
+```
+
+图形 console 截图（QEMU，`-serial none`）：
+
+![QEMU UEFI 启动后的本地 framebuffer console](output/verification/uefi-console-login.png)
+
+本地键盘登录后的 root shell：[uefi-console-root-shell.png](output/verification/uefi-console-root-shell.png)。
+
+完整串口日志保存在 `output/verification/qemu-boot-serial.log`。QEMU 验证覆盖 UEFI 固件→GRUB→内核→init→login 的启动链，但**不能替代目标机的 USB 控制器、GPU/固件和 Secure Boot 兼容性测试**。
+
+### 8.6 功能自测（宿主开发配置）
 
 使用临时配置文件和临时数据目录，对**从最终镜像 squashfs 提取的同一个静态二进制**执行了完整流程：
 
@@ -728,11 +764,11 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 - 独立 Python 实现按 `prev_hash,timestamp,action,serial,subject,time_source` 的紧凑 JSON 重算 SHA-256，验证 3 条审计记录，链尾 `de2f1b4affc6b24e73e2e2ebe67d2d98bf56135936d13223d0de98f0b3f8a1a6`；
 - 中间 CA 私钥与证书公钥哈希一致；`root-ca.key.enc` 中不含明文 `PRIVATE KEY` 字符串。
 
-这些是命令行功能自测，**不是启动测试**；没有运行 QEMU、VirtualBox、Docker 或真机。
+这些是命令行功能自测；QEMU 启动链验证见 8.5，真机尚未验证。
 
 ## 9. 已知限制
 
-1. **未做启动测试。** 本轮没有运行 QEMU、VirtualBox、Docker 或真机，因此没有验证引导链、内核启动、init 脚本实际执行、LUKS 交互、字符设备/存储控制器兼容性等。镜像中的配置和内容已静态验证，但首次启动流程必须在目标硬件上验证。
+1. **未做真机启动测试。** 已在 QEMU/OVMF 中验证 UEFI→GRUB→内核→init→login，并确认本地 framebuffer console 可用（见 8.5）；但尚未在真实目标硬件上验证 USB 控制器、GPU/固件差异、LUKS 交互和长时间运行。首次真机启动仍需按第 4 节执行。
 2. **p3 必须首次手工格式化。** 镜像构建阶段和 `S10caos-data` 都不会自动调用 `luksFormat`。如果不做这一步，系统仍可启动，但没有 CA 数据分区可用。
 3. **仅支持 x86_64 UEFI，无 Legacy/CSM 回退。** 目标固件必须从 GPT ESP 启动；本镜像不包含 BIOS 引导代码、SYSLINUX/extlinux 或 hybrid MBR 启动项。UEFI Secure Boot 也没有配置签名，测试/部署时需要在固件中关闭 Secure Boot，或自行完成 GRUB 与内核的签名及密钥管理。部分固件若不自动使用可移动介质默认路径，需要在一次性启动菜单中手工选择 `UEFI: <介质名>`。
 4. **Console root 密码默认空。** 这是 Buildroot 默认行为。由于根文件系统只读，运行时 `passwd` 不能持久保存；生产镜像应在构建时通过 `BR2_TARGET_GENERIC_ROOT_PASSWD` 设置 root hash，或限制物理接触并用机柜锁/受控维护流程。当前镜像的 `/etc/motd` 和 `S20caos-ca` 会打印警告。
@@ -782,6 +818,7 @@ runtime_dir = "/run/caos-ca"
 | 无法从 SD 卡启动 | 确认固件为 UEFI-only、已关闭 CSM/Secure Boot；确认 `dd` 写的是整盘而不是分区；在 Boot Menu 选择 `UEFI: <介质名>`；检查 p1 是否为 EFI System Partition 且包含 `\EFI\BOOT\BOOTX64.EFI` |
 | 固件报 Secure Boot violation | 本镜像未签名；关闭 Secure Boot，或自行签名 GRUB/内核并管理密钥 |
 | GRUB 找不到 `CAOSBOOT` 或 `grub.cfg` | 重新写盘；用 `validate-image.py` 检查 p1 类型、FAT32 卷标与 `\EFI\BOOT\grub.cfg` 是否存在 |
+| 屏幕停在 `Booting ...`，但 U 盘灯已灭 | 先接串口：若串口已到 `caos login:`，说明系统已启动，缺的是本地 framebuffer console；确认内核含 8.3 的 DRM/fbcon 选项。若串口停在 `Waiting for root device`，检查 USB 控制器/端口/存储设备 |
 | 串口无输出 | 115200 8N1；确认 `console=ttyS0,115200` 生效；检查 ttyS0 电平/适配器 |
 | 启动后没有 `/mnt/ca-data` | 查看 `S10caos-data` console 输出；确认 p3 已 LUKS2 格式化并 ext4 |
 | `caos-ca` 报时钟错误 | RTC 时间早于二进制构建时间；在固件设置或 console 设置正确时间后重试 |
