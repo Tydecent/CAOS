@@ -9,7 +9,7 @@ exact commands if the partition is still empty or unformatted.  The image
 itself deliberately contains no LUKS header and no CA private keys.
 
 The CA tools run as the unprivileged "caos" user:
-  su -s /bin/sh caos
+  su -l -s /bin/sh caos
   caos-ca init
   caos-ca issue --cn host.example --san host.example
 

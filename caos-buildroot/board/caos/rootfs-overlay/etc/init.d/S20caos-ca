@@ -40,14 +40,14 @@ fi
 if [ ! -f "$DATA_MOUNT/db/metadata.json" ]; then
     echo "CAOS: CA has not been initialized on this data partition."
     echo "CAOS: log in as root, then run:"
-    echo "CAOS:   su -s /bin/sh caos"
+    echo "CAOS:   su -l -s /bin/sh caos"
     echo "CAOS:   caos-ca init"
     exit 0
 fi
 
 if su -s /bin/sh -c "$CAOS_CA --config $CONFIG verify" caos >"$VERIFY_LOG" 2>&1; then
     echo "CAOS: startup integrity verification succeeded."
-    echo "CAOS: operational commands are manual; use: su -s /bin/sh caos"
+    echo "CAOS: operational commands are manual; use: su -l -s /bin/sh caos"
 else
     echo "CAOS: WARNING: startup integrity verification FAILED."
     echo "CAOS: details: $VERIFY_LOG"

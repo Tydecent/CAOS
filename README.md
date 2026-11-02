@@ -263,7 +263,7 @@ LUKS header 损坏或丢失时，单独的 passphrase 无法恢复数据。之�
 镜像的 root 文件系统只读，CA 数据全部位于加密分区。root 登录后切换到专用的 `caos` 用户（该用户没有可直接登录的密码）：
 
 ```bash
-su -s /bin/sh caos
+su -l -s /bin/sh caos
 caos-ca init
 ```
 
@@ -297,7 +297,7 @@ caos-ca verify
 
 ```bash
 # 从 root console
-su -s /bin/sh caos
+su -l -s /bin/sh caos
 
 # 工具默认读取 /etc/caos-ca/config.toml
 caos-ca --help
