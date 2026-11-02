@@ -215,7 +215,17 @@ do
     grep -qx "$option" "$KERNEL_CONFIG" \
         || fail "$KERNEL_CONFIG does not contain $option"
 done
-echo "[CAOS] kernel air-gap, GPT-only and UEFI fbcon policy verified in $KERNEL_CONFIG"
+# Do not build drivers that are useless for the appliance and have caused
+# long probe timeouts/reset storms on some ASUS firmware.
+for option in \
+    '# CONFIG_SOUND is not set' \
+    '# CONFIG_INTEL_MEI is not set' \
+    '# CONFIG_DRM_I915 is not set'
+do
+    grep -qx "$option" "$KERNEL_CONFIG" \
+        || fail "$KERNEL_CONFIG does not contain $option"
+done
+echo "[CAOS] kernel air-gap, GPT-only, UEFI fbcon and trimmed-driver policy verified in $KERNEL_CONFIG"
 
 # cryptsetup's "kernel" backend uses AF_ALG, which does not exist with
 # CONFIG_NET=n.  It must be built against a userspace backend (gcrypt here),

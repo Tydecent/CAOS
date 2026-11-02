@@ -555,7 +555,8 @@ print(f"OK: {n} audit records, tip={prev}")
 - 首次迁移构建清空 `output/build`、`output/host`、`output/images`、`output/.config` 等全部构建状态（保留 `output/dl` 下载缓存），清理 Rust target 后，以 `JOBS=8 ./build.sh` 重新构建；Stage 5 于 `20:36` 成功。
 - 修复 UEFI framebuffer console 时，在 `linux.fragment` 增加 `DRM_FBDEV_EMULATION`/`simpledrm`/`fbcon` 后，以 `JOBS=8 ./build.sh` 增量重建；内核和镜像于 `20:49` 重新生成，Rust/工具链/GRUB 复用已构建结果。
 - 修复 LUKS2 初始化时，在 `caos_defconfig` 增加 `BR2_PACKAGE_LIBGCRYPT=y` 并清理重建 `cryptsetup`；`09:51` 重新生成 rootfs 和 `sdcard.img`。
-- 三次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
+- 针对 ASUS 兼容性关闭 `SOUND`、`INTEL_MEI`、`DRM_I915` 后，`10:01` 重新生成内核和镜像；内核从 10,343,424 字节降到 8,311,808 字节。
+- 四次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
 - `output/build.log` 的错误扫描：
 
 ```text
@@ -589,27 +590,27 @@ ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[
 ```text
 $ grep -nE '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set|CONFIG_(PARTITION_ADVANCED|STRICT_KERNEL_RWX|RANDOMIZE_BASE|EFI_PARTITION|DM_CRYPT|SQUASHFS_XZ)=y)' \
     output/build/linux-6.18.55/.config
-471:CONFIG_RANDOMIZE_BASE=y
+472:CONFIG_RANDOMIZE_BASE=y
 853:CONFIG_STRICT_KERNEL_RWX=y
 894:# CONFIG_MODULES is not set
 915:CONFIG_PARTITION_ADVANCED=y
 922:# CONFIG_MSDOS_PARTITION is not set
 928:CONFIG_EFI_PARTITION=y
-1074:# CONFIG_NET is not set
-1570:CONFIG_DM_CRYPT=y
-3755:CONFIG_SQUASHFS_XZ=y
+1073:# CONFIG_NET is not set
+1562:CONFIG_DM_CRYPT=y
+3581:CONFIG_SQUASHFS_XZ=y
 
 $ grep -cE '^CONFIG_(NET|INET|IPV6|PACKET)=' output/build/linux-6.18.55/.config
 0
 
 $ grep -nE '^(CONFIG_(DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFFER_CONSOLE|FRAMEBUFFER_CONSOLE_DETECT_PRIMARY)=y|# CONFIG_FB is not set)' \
     output/build/linux-6.18.55/.config
-1240:CONFIG_SYSFB_SIMPLEFB=y
-2472:CONFIG_DRM_FBDEV_EMULATION=y
-2495:CONFIG_DRM_SIMPLEDRM=y
-2564:# CONFIG_FB is not set
-2610:CONFIG_FRAMEBUFFER_CONSOLE=y
-2612:CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
+1236:CONFIG_SYSFB_SIMPLEFB=y
+2458:CONFIG_DRM_FBDEV_EMULATION=y
+2472:CONFIG_DRM_SIMPLEDRM=y
+2527:# CONFIG_FB is not set
+2568:CONFIG_FRAMEBUFFER_CONSOLE=y
+2570:CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y
 ```
 
 说明：
@@ -622,6 +623,15 @@ $ grep -nE '^(CONFIG_(DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFF
 - **LUKS2 不能使用 cryptsetup 的 kernel crypto backend。** `CONFIG_NET=n` 后，`CRYPTO_USER_API_HASH`/`CRYPTO_USER_API_SKCIPHER` 等 AF_ALG 接口被隐藏，`cryptsetup` 初始化 kernel backend 时 `socket(AF_ALG)` 失败，表现为 `Cannot initialize crypto backend` / `Failed to set pbkdf parameters`。因此 defconfig 增加 `BR2_PACKAGE_LIBGCRYPT=y`，Buildroot 的 cryptsetup 配置为 `--with-crypto_backend=gcrypt`，Argon2 仍由 `libargon2` 提供；内核侧 `CONFIG_DM_CRYPT=y`、`CONFIG_CRYPTO_AES=y`、`CONFIG_CRYPTO_XTS=y` 负责挂载后的 dm-crypt 数据路径。`build.sh` 同时检查这三个内核选项和 cryptsetup 的 gcrypt 配置，防止回退到需要 AF_ALG 的 kernel backend。
 - `CONFIG_EFI_PARTITION=y` 保证 `root=PARTLABEL=CAOSROOT` 能从标准 GPT 解析分区名；最终 `.config` 中 **只有** `CONFIG_EFI_PARTITION=y`，`# CONFIG_MSDOS_PARTITION is not set`，镜像不依赖 DOS/MBR 分区解析器。
 - 内核由 GRUB 的 `linux` 命令通过 Linux boot protocol 装载，不需要把 `bzImage` 当作 EFI 可执行文件直接启动；`CONFIG_EFI`/`CONFIG_EFI_STUB` 是 x86_64 defconfig 的既有设置，不是本启动链的额外依赖。
+
+#### ASUS 启动兼容性
+
+ASUS 机器最初停在 `Booting ...`，使用带 `nomodeset` 的兼容入口后能进入内核，但出现大量 `snd_hda_intel` 超时、`mei_me` 反复复位，以及 xHCI 的 `Error while assigning device slot ID: Command Aborted`。为此做了两项定向裁剪：
+
+- 内核关闭 `CONFIG_SOUND`、`CONFIG_INTEL_MEI`、`CONFIG_DRM_I915`。本地显示继续由 `simpledrm` + fbcon 提供；CA 设备不需要音频、ME 或 3D/GPU 驱动。内核因此从约 10.3 MiB 降到 8.31 MiB。
+- GRUB 的兼容入口移除了 `noapic`、`acpi_osi=`、`pcie_aspm=off`、`pci=noaer` 和 `nomodeset` 等堆叠参数，只保留 `earlycon=efifb keep_bootcon`。其中 `noapic` 会破坏现代 xHCI/MSI 环境，不应作为通用兜底参数。
+
+如果 ASUS 上仍出现 xHCI slot/port 错误，这不是再禁用某个驱动能解决的：`USB_XHCI_HCD` 和 `USB_STORAGE` 是 rootfs 所在 U 盘的必经路径。应优先换到后置 USB 2.0 端口（避免前面板 hub/USB-C 转接）、更新或重置 BIOS，再观察是否仍出现 `Max number of devices this xHCI host supports is 64`。
 
 目标 rootfs 额外验证无网络用户态：
 
@@ -636,24 +646,24 @@ $ grep -nE '^(CONFIG_(DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFF
 
 ```text
 $ ls -l output/images
--rw-r--r-- 1 ...  67108864 Nov  1 20:49 boot.vfat
--rw-r--r-- 1 ...  10343424 Nov  1 20:49 bzImage
+-rw-r--r-- 1 ...  67108864 Nov  2 10:01 boot.vfat
+-rw-r--r-- 1 ...   8311808 Nov  2 10:01 bzImage
 drwxr-xr-x 3 ...      4096 Oct 31 20:32 efi-part
--rw-r--r-- 1 ...   6651904 Nov  1 20:49 rootfs.squashfs
--rw-r--r-- 1 ... 336613376 Nov  1 20:49 sdcard.img
+-rw-r--r-- 1 ...   7331840 Nov  2 10:01 rootfs.squashfs
+-rw-r--r-- 1 ... 336613376 Nov  2 10:01 sdcard.img
 
 $ ls -l output/images/efi-part/EFI/BOOT
 -rw-r--r-- 1 ... 675840 Oct 31 20:32 bootx64.efi
--rw-r--r-- 1 ...    421 Nov  1 20:49 grub.cfg
+-rw-r--r-- 1 ...    632 Nov  2 10:01 grub.cfg
 ```
 
 SHA-256：
 
 ```text
-39cbc95db515bd379c2d0d5b6e1124abc3016dabc961d9f30dc615e6e16d7871  output/images/sdcard.img
-02227965e79ab6125f6d2c375972889909fb9d99ce88100af18f261f76c8fa52  output/images/boot.vfat
-0adbc062b419e4b68878a7416614d11c8cc97fe0c5ca64a3005c48b9331ed086  output/images/rootfs.squashfs
-58fa4a04bc4ce2d5f98f51b73141ce1e68e97fc1c2eac66cca8110d2804c468c  output/images/bzImage
+21cf81f414173533896b715ab0173712d3b961f99a0a37741a59396c645b9fab  output/images/sdcard.img
+ca371bdbe6c4fb64c7824c046c6b49b848f68141620c925ed16bf61886d82c4d  output/images/boot.vfat
+d3be62e184cc05cdcd5c598559576c3896139c44fc3d0623090537e0f9bbdd20  output/images/rootfs.squashfs
+e0e690519e55801aeb9265b149aa07acee21af363e1414b40eca07847eb8dd68  output/images/bzImage
 109808670e8d795f627b6c2efda8172e99671ad62c4a496a2d589403cf987cf2  output/images/efi-part/EFI/BOOT/bootx64.efi
 d64c7e2be0ba202c3f46e41a86318a126e8293e160b886a6d61c6f460af64843  caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
 ```
@@ -680,16 +690,13 @@ set prefix=($root)/EFI/BOOT
 configfile ($root)/EFI/BOOT/grub.cfg
 ```
 
-5. **ESP 上的启动菜单传参完整。** 内容为：
+5. **ESP 上的启动菜单传参完整。** 当前 `grub.cfg` 有默认 `CAOS` 和兼容入口 `CAOS - Compatible` 两项，`timeout=5`；默认入口的命令行为：
 
 ```text
-set timeout=0
-set default=0
-
-menuentry "CAOS - Air-Gapped Certificate Authority" {
-    linux /zImage console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait
-}
+linux /zImage console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait
 ```
+
+   两个入口都保留 `root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait`；兼容入口额外使用 `earlycon=efifb keep_bootcon`，不再使用 `noapic`/`nomodeset`。
 
 6. **GPT/ESP 校验器通过。** `caos-buildroot/board/caos/validate-image.py` 实测输出：
 
@@ -739,11 +746,11 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 关键日志：
 
 ```text
-[    0.865898] [drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0
-[    0.897930] Console: switching to colour frame buffer device 160x50
-[    0.903948] simple-framebuffer simple-framebuffer.0: [drm] fb0: simpledrmdrmfb frame buffer device
-[    2.283056] VFS: Mounted root (squashfs filesystem) readonly on device 8:2.
-[    2.433835] Run /sbin/init as init process
+[    1.370354] [drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0
+[    1.444714] Console: switching to colour frame buffer device 160x50
+[    1.456249] simple-framebuffer simple-framebuffer.0: [drm] fb0: simpledrmdrmfb frame buffer device
+[    2.840217] VFS: Mounted root (squashfs filesystem) readonly on device 8:2.
+[    3.215198] Run /sbin/init as init process
 caos login:
 ```
 
@@ -850,6 +857,7 @@ runtime_dir = "/run/caos-ca"
 | GRUB 找不到 `CAOSBOOT` 或 `grub.cfg` | 重新写盘；用 `validate-image.py` 检查 p1 类型、FAT32 卷标与 `\EFI\BOOT\grub.cfg` 是否存在 |
 | 屏幕停在 `Booting ...`，但 U 盘灯已灭 | 先接串口：若串口已到 `caos login:`，说明系统已启动，缺的是本地 framebuffer console；确认内核含 8.3 的 DRM/fbcon 选项。若串口停在 `Waiting for root device`，检查 USB 控制器/端口/存储设备 |
 | `cryptsetup` 报 `Cannot initialize crypto backend` / `Failed to set pbkdf parameters` | 说明 cryptsetup 用了 kernel/AF_ALG 后端，但 `CONFIG_NET=n` 下 AF_ALG 不存在；确认 `BR2_PACKAGE_LIBGCRYPT=y` 且 cryptsetup 配置为 `--with-crypto_backend=gcrypt`（见 8.3），再重建 |
+| ASUS 上出现 `xhci_hcd ... Error while assigning device slot ID` / `Max number of devices this xHCI host supports is 64` | 不要禁用 xHCI/USB_STORAGE（根文件系统在 U 盘）；换后置 USB 2.0 端口、绕开前面板 hub/USB-C 转接，更新或重置 BIOS，并确认没有使用 `noapic` |
 | 串口无输出 | 115200 8N1；确认 `console=ttyS0,115200` 生效；检查 ttyS0 电平/适配器 |
 | 启动后没有 `/mnt/ca-data` | 查看 `S10caos-data` console 输出；确认 p3 已 LUKS2 格式化并 ext4 |
 | `caos-ca` 报时钟错误 | RTC 时间早于二进制构建时间；在固件设置或 console 设置正确时间后重试 |
