@@ -1,0 +1,29 @@
+From: CAOS <caos@example.invalid>
+Subject: [PATCH] nscd_query: treat a missing socket syscall as "no nscd"
+
+musl's getgrouplist() (and therefore initgroups(), and therefore BusyBox
+`su`, `login` and `id NAME`) first asks nscd over an AF_UNIX socket.
+
+__nscd_query() already tolerates a kernel that has no AF_UNIX support by
+treating EAFNOSUPPORT as "nscd is not running".  CAOS builds its kernel with
+CONFIG_NET=n, which removes net/socket.c entirely: every socket-related
+syscall is then routed to sys_ni_syscall() and fails with ENOSYS instead of
+EAFNOSUPPORT.  musl treated that as a hard error, so getgrouplist() failed
+with ENOSYS and BusyBox reported:
+
+    su: can't set groups: Function not implemented
+
+Treat ENOSYS the same way as EAFNOSUPPORT: fall through to the /etc/group
+backend.  This keeps working on kernels that simply lack Unix domain
+sockets, which is exactly the air-gapped CAOS configuration.
+--- a/src/passwd/nscd_query.c
++++ b/src/passwd/nscd_query.c
+@@ -41,7 +41,7 @@
+ 
+ 	fd = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+ 	if (fd < 0) {
+-		if (errno == EAFNOSUPPORT) {
++		if (errno == EAFNOSUPPORT || errno == ENOSYS) {
+ 			f = fopen("/dev/null", "re");
+ 			if (f)
+ 				errno = errno_save;

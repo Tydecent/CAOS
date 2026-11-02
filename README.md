@@ -45,6 +45,7 @@ project/
 │   │   ├── post-build.sh
 │   │   ├── post-fakeroot.sh          # 记录最终 root:root / caos:caos 属主
 │   │   ├── post-image.sh             # FAT32 ESP、GRUB EFI、genimage GPT
+│   │   ├── patches/musl/             # BR2_GLOBAL_PATCH_DIR：musl 补丁
 │   │   └── users.txt                 # caos UID/GID 1000
 ├── build.sh                          # 一键构建（Rust → Buildroot → 验证）
 ├── README.md
@@ -55,7 +56,7 @@ project/
     ├── rust-build.log
     ├── clippy.log
     ├── build.log                     # 完整 Buildroot 日志
-    └── verification/summary.txt
+    └── verification/                 # summary、GPT/ESP 校验、QEMU 串口与截图
 ```
 
 Buildroot 浅克隆 `../buildroot-2026.08.1/` 未做修改。下载目录通过 `BR2_DL_DIR` 指向 `output/dl/`，输出通过 `O=output/` 指向项目内，因此不会写入 `buildroot-2026.08.1/output/`。
@@ -452,6 +453,28 @@ ls /sys/class/net 2>/dev/null || echo "no network class"
 - `busybox.fragment` 关闭 `ip`、`ifconfig`、`ping`、`wget`、`nc`、`route`、`telnet`、`tftp`、DHCP、DNS 查询等网络 applet；
 - `post-build.sh` 在打包前再次查找这些命令，发现即失败。
 
+#### 副作用：内核没有 `socket(2)` 时 `su` 会失败
+
+`CONFIG_NET=n` 不只是“没有网卡”：`net/socket.c` 整个不参与编译，`socket`/`connect`/`socketpair` 等系统调用在 `kernel/sys_ni.c` 中被登记为 `COND_SYSCALL`，统一返回 `ENOSYS`。
+
+musl 的 `getgrouplist()` 会先通过 AF_UNIX socket 询问 nscd，失败时才回退到 `/etc/group`。musl 1.2.6 的 `__nscd_query()` 只把 `EAFNOSUPPORT` 当作“没有 nscd”，于是 `ENOSYS` 被当成硬错误：`getgrouplist()` 返回 -1 且 `errno=ENOSYS`，`initgroups()` 随之失败，BusyBox `su` 在 `change_identity()` 里报错：
+
+```text
+su: can't set groups: Function not implemented
+```
+
+它的连带影响不止 `su`：`id caos` 也会打印一串错误的组，`S20caos-ca` 的启动前 `caos-ca verify` 也会失败。这与 `/etc/group` 是否完整无关（镜像里的 `caos:x:1000:` 一直是对的）。
+
+修复方式是给 musl 打一个最小补丁，让 `ENOSYS` 与 `EAFNOSUPPORT` 等价处理：
+
+```text
+board/caos/patches/musl/0001-nscd_query-treat-ENOSYS-as-no-nscd.patch
+-       if (errno == EAFNOSUPPORT) {
++       if (errno == EAFNOSUPPORT || errno == ENOSYS) {
+```
+
+补丁目录通过 `BR2_GLOBAL_PATCH_DIR` 挂到 Buildroot（只在外部树里，不改 Buildroot 源码），`build.sh` 会检查最终参与构建的 musl 源码确实带有这一行。
+
 ### 6.2 CA 文件完整性
 
 `init`/`issue`/`revoke` 后，`integrity.json` 记录静态 CA 文件的哈希；`verify` 会重新计算并与清单比较。此外 `verify` 会用成熟 crate（`x509-parser` + `ring`）验证 X.509 证书链、证书与私钥匹配，以及已签发证书的哈希/序列号/签名。
@@ -536,6 +559,7 @@ print(f"OK: {n} audit records, tip={prev}")
 - `genimage.cfg` 只生成标准 GPT（`partition-table-type = "gpt"`），p1 类型为 EFI System Partition；GPT 名称提供 `CAOSROOT`/`CAOSDATA` 定位依据。保护性 MBR 由 GPT 规范要求，只有 `0xEE` 项，没有引导代码或 active 标志。
 - UEFI 启动链：Buildroot 的 GRUB 2.14 `x86_64-efi` 应用 → `\EFI\BOOT\BOOTX64.EFI`；嵌入脚本按 FAT 卷标 `CAOSBOOT` 找到 ESP 并执行 `\EFI\BOOT\grub.cfg`；菜单项用 `linux /zImage ...` 传递完整命令行。`post-image.sh` 只创建 FAT32 ESP 并调用 `genimage`，不写 BIOS MBR 引导代码、不安装 SYSLINUX；genimage 按 GPT 规范生成保护性 MBR。
 - `board/caos/validate-image.py` 独立解析 GPT 头、主/备份分区数组、保护性 MBR、ESP FAT 标签和 CAOSDATA 空白状态，`build.sh` 在 Stage 4 调用它。
+- `BR2_GLOBAL_PATCH_DIR=board/caos/patches`：目前只有一个 musl 补丁（`nscd_query.c` 把 `ENOSYS` 也当作“没有 nscd”），用于让 `su`/`initgroups()` 在 `CONFIG_NET=n`（没有 `socket(2)`）的内核上工作。补丁仍留在外部树内，Buildroot 源码树依旧零修改。
 
 ---
 
@@ -556,7 +580,8 @@ print(f"OK: {n} audit records, tip={prev}")
 - 修复 UEFI framebuffer console 时，在 `linux.fragment` 增加 `DRM_FBDEV_EMULATION`/`simpledrm`/`fbcon` 后，以 `JOBS=8 ./build.sh` 增量重建；内核和镜像于 `20:49` 重新生成，Rust/工具链/GRUB 复用已构建结果。
 - 修复 LUKS2 初始化时，在 `caos_defconfig` 增加 `BR2_PACKAGE_LIBGCRYPT=y` 并清理重建 `cryptsetup`；`09:51` 重新生成 rootfs 和 `sdcard.img`。
 - 针对 ASUS 兼容性关闭 `SOUND`、`INTEL_MEI`、`DRM_I915` 后，`10:01` 重新生成内核和镜像；内核从 10,343,424 字节降到 8,311,808 字节。
-- 四次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
+- 修复 `su: can't set groups` 时，新增 `BR2_GLOBAL_PATCH_DIR` + musl 补丁（见 6.1 与 8.7）。因为改的是 libc，必须重建工具链：清空 `output/build`、`output/host`、`output/target`、`output/images`、`output/.config` 等（保留 `output/dl`），`14:01` 以 `JOBS=8 ./build.sh` 完整重跑，Stage 5 成功。
+- 五次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
 - `output/build.log` 的错误扫描：
 
 ```text
@@ -571,10 +596,10 @@ $ grep -E '^ERROR:|^make(\[[0-9]+\])?: \*\*\*|No space left on device' output/bu
 `file target/x86_64-unknown-linux-musl/release/caos-ca`：
 
 ```text
-ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[sha1]=d99c1c7c8071cdd47a8efa19a22efbcac62af43e, stripped
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, BuildID[sha1]=d79bb0af1ab01088497244f95da6f59c83bc5b22, stripped
 ```
 
-- SHA-256：`d64c7e2be0ba202c3f46e41a86318a126e8293e160b886a6d61c6f460af64843`
+- SHA-256：`179076486b65e09d647e9bece28eecf298e0e47dee2d74e00fd9ec351f03ea75`
 - 大小：`2,183,696` bytes（约 2.08 MiB）
 - 权限/属主（最终 squashfs 内）：`root:root`、`0755`
 - 从 `rootfs.squashfs` 提取出的二进制 SHA-256 与 overlay 中完全一致。
@@ -629,7 +654,7 @@ $ grep -nE '^(CONFIG_(DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFF
 ASUS 机器最初停在 `Booting ...`，使用带 `nomodeset` 的兼容入口后能进入内核，但出现大量 `snd_hda_intel` 超时、`mei_me` 反复复位，以及 xHCI 的 `Error while assigning device slot ID: Command Aborted`。为此做了两项定向裁剪：
 
 - 内核关闭 `CONFIG_SOUND`、`CONFIG_INTEL_MEI`、`CONFIG_DRM_I915`。本地显示继续由 `simpledrm` + fbcon 提供；CA 设备不需要音频、ME 或 3D/GPU 驱动。内核因此从约 10.3 MiB 降到 8.31 MiB。
-- GRUB 的兼容入口移除了 `noapic`、`acpi_osi=`、`pcie_aspm=off`、`pci=noaer` 和 `nomodeset` 等堆叠参数，只保留 `earlycon=efifb keep_bootcon`。其中 `noapic` 会破坏现代 xHCI/MSI 环境，不应作为通用兜底参数。
+- GRUB 的兼容入口不再堆叠 `acpi_osi=`、`pcie_aspm=off`、`pci=noaer` 等参数，最后停在 `earlycon=efifb keep_bootcon noapic nomodeset`（见 `board/caos/grub.cfg` 与提交 `12222ed`）。需要清醒认识的是：`noapic` 会破坏现代 xHCI/MSI 环境，`nomodeset` 会让 framebuffer console 失效，因此这个入口只是最后手段，默认入口不应带它们；在 ASUS 上的定向适配到此为止，不再继续添加参数。
 
 如果 ASUS 上仍出现 xHCI slot/port 错误，这不是再禁用某个驱动能解决的：`USB_XHCI_HCD` 和 `USB_STORAGE` 是 rootfs 所在 U 盘的必经路径。应优先换到后置 USB 2.0 端口（避免前面板 hub/USB-C 转接）、更新或重置 BIOS，再观察是否仍出现 `Max number of devices this xHCI host supports is 64`。
 
@@ -646,26 +671,26 @@ ASUS 机器最初停在 `Booting ...`，使用带 `nomodeset` 的兼容入口后
 
 ```text
 $ ls -l output/images
--rw-r--r-- 1 ...  67108864 Nov  2 10:01 boot.vfat
--rw-r--r-- 1 ...   8311808 Nov  2 10:01 bzImage
-drwxr-xr-x 3 ...      4096 Oct 31 20:32 efi-part
--rw-r--r-- 1 ...   7331840 Nov  2 10:01 rootfs.squashfs
--rw-r--r-- 1 ... 336613376 Nov  2 10:01 sdcard.img
+-rw-r--r-- 1 ...  67108864 Nov  2 14:01 boot.vfat
+-rw-r--r-- 1 ...   8311808 Nov  2 14:01 bzImage
+drwxr-xr-x 3 ...      4096 Nov  2 13:58 efi-part
+-rw-r--r-- 1 ...   7331840 Nov  2 14:01 rootfs.squashfs
+-rw-r--r-- 1 ... 336613376 Nov  2 14:01 sdcard.img
 
 $ ls -l output/images/efi-part/EFI/BOOT
--rw-r--r-- 1 ... 675840 Oct 31 20:32 bootx64.efi
--rw-r--r-- 1 ...    632 Nov  2 10:01 grub.cfg
+-rw-r--r-- 1 ... 675840 Nov  2 13:58 bootx64.efi
+-rw-r--r-- 1 ...    632 Nov  2 14:01 grub.cfg
 ```
 
 SHA-256：
 
 ```text
-21cf81f414173533896b715ab0173712d3b961f99a0a37741a59396c645b9fab  output/images/sdcard.img
-ca371bdbe6c4fb64c7824c046c6b49b848f68141620c925ed16bf61886d82c4d  output/images/boot.vfat
-d3be62e184cc05cdcd5c598559576c3896139c44fc3d0623090537e0f9bbdd20  output/images/rootfs.squashfs
-e0e690519e55801aeb9265b149aa07acee21af363e1414b40eca07847eb8dd68  output/images/bzImage
+ca5e445f1d8ed734c927b563c71adec58743c7440d5b75600b8d38488d73346f  output/images/sdcard.img
+d309eeb3cf4d066cb5d1a9acfea0bec1c4e183d63fb6e7714f4b8b32c1912b42  output/images/boot.vfat
+1fe789f4fc258dee4b162ba24dabcbffd04a8c22d600fca4449ebd98dd060cb3  output/images/rootfs.squashfs
+18a9244bc1652d02072a92e5c9ed866a1843c45df1e58695b13864ff1594b442  output/images/bzImage
 109808670e8d795f627b6c2efda8172e99671ad62c4a496a2d589403cf987cf2  output/images/efi-part/EFI/BOOT/bootx64.efi
-d64c7e2be0ba202c3f46e41a86318a126e8293e160b886a6d61c6f460af64843  caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
+179076486b65e09d647e9bece28eecf298e0e47dee2d74e00fd9ec351f03ea75  caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
 ```
 
 UEFI/GPT 验收：
@@ -696,7 +721,7 @@ configfile ($root)/EFI/BOOT/grub.cfg
 linux /zImage console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait
 ```
 
-   两个入口都保留 `root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait`；兼容入口额外使用 `earlycon=efifb keep_bootcon`，不再使用 `noapic`/`nomodeset`。
+   两个入口都保留 `root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait`；兼容入口额外使用 `earlycon=efifb keep_bootcon noapic nomodeset`，是最后手段而不是推荐方案（见 8.3 的 ASUS 说明）。
 
 6. **GPT/ESP 校验器通过。** `caos-buildroot/board/caos/validate-image.py` 实测输出：
 
@@ -737,20 +762,19 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 
 ### 8.5 QEMU UEFI 启动验证
 
-使用宿主机 QEMU 10.2.1 + OVMF（edk2 `2025.11-3ubuntu7.3`）对最终 `sdcard.img` 做了多次纯 UEFI 启动：
+使用宿主机 QEMU 10.2.1 + OVMF（edk2 `2025.11-3ubuntu7.3`）对最终 `sdcard.img` 做了多次纯 UEFI 启动（每次都在 qcow2 覆盖层上，不写回 `output/images/sdcard.img`）：
 
 1. 将镜像作为 `qemu-xhci` 下的 `usb-storage` 设备，串口输出到文件，确认内核、USB 枚举、`PARTLABEL=CAOSROOT` 根挂载和 init 全流程；
-2. 关闭串口（`-serial none`），仅保留图形 framebuffer，确认本地屏幕能显示内核日志和 `caos login:`；再用 QEMU `sendkey` 从本地 console 输入 `root`，成功进入 root shell，证明 `tty1`/键盘输入链路也正常；
-3. 在 `-snapshot` 临时镜像上，以 `/etc/hostname` 作为测试 key-file 执行 LUKS2 格式化、打开、`mkfs.ext4`、读写挂载、卸载和关闭，不写回最终镜像。
+2. 仅保留图形 framebuffer，确认本地屏幕能显示内核日志和 `caos login:`；再用 QEMU monitor 的 `sendkey` 从本地 console 输入 `root`，成功进入 root shell，证明 `tty1`/键盘输入链路也正常；
+3. 以 `/etc/hostname` 作为测试 key-file 执行 LUKS2 格式化、打开、`mkfs.ext4`、读写挂载、卸载和关闭。
 
 关键日志：
 
 ```text
-[    1.370354] [drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0
-[    1.444714] Console: switching to colour frame buffer device 160x50
-[    1.456249] simple-framebuffer simple-framebuffer.0: [drm] fb0: simpledrmdrmfb frame buffer device
-[    2.840217] VFS: Mounted root (squashfs filesystem) readonly on device 8:2.
-[    3.215198] Run /sbin/init as init process
+[    1.273700] [drm] Initialized simpledrm 1.0.0 for simple-framebuffer.0 on minor 0
+[    1.303677] Console: switching to colour frame buffer device 160x50
+[    1.309590] simple-framebuffer simple-framebuffer.0: [drm] fb0: simpledrmdrmfb frame buffer device
+[    2.647438] VFS: Mounted root (squashfs filesystem) readonly on device 8:2.
 caos login:
 ```
 
@@ -764,7 +788,11 @@ LUKS2 实测（QEMU 临时快照）：
   type:    LUKS2
   cipher:  aes-xts-plain64
   keysize: 512 [bits]
+  key location: keyring
   device:  /dev/sda3
+  sector size:  512 [bytes]
+  offset:  32768 [512-byte units] (16777216 [bytes])
+  size:    229376 [512-byte units] (117440512 [bytes])
   mode:    read/write
 # cryptsetup isLuks /dev/sda3; echo isLuks_rc=$?
 isLuks_rc=0
@@ -781,7 +809,7 @@ close_rc=0
 
 完整 LUKS2 会话日志：[luks2-test.log](output/verification/luks2-test.log)。`luksFormat` 不再出现 `Cannot initialize crypto backend` 或 `Failed to set pbkdf parameters`，并完成 `mkfs.ext4`、读写挂载和卸载。
 
-图形 console 截图（QEMU，`-serial none`）：
+图形 console 截图（QEMU monitor `screendump`，1280x800）：
 
 ![QEMU UEFI 启动后的本地 framebuffer console](output/verification/uefi-console-login.png)
 
@@ -802,6 +830,52 @@ close_rc=0
 - 中间 CA 私钥与证书公钥哈希一致；`root-ca.key.enc` 中不含明文 `PRIVATE KEY` 字符串。
 
 这些是命令行功能自测；QEMU 启动链验证见 8.5，真机尚未验证。
+
+### 8.7 `su`/`initgroups` 修复验证（QEMU）
+
+在修复前，对最终镜像做 QEMU UEFI 启动、以 root 登录后实测：
+
+```text
+# id caos
+uid=1000(caos) gid=1000(caos) groups=1000(caos),0(root),0(root),... （共 64 项，全是 0）
+# su -s /bin/sh caos -c 'id'; echo RC=$?
+su: can't set groups: Function not implemented
+RC=1
+# ls /proc/sys/net
+ls: /proc/sys/net: No such file or directory
+```
+
+`id caos` 打印 64 个错误组是同一根因的第二个症状：`getgrouplist()` 失败后 BusyBox 忽略返回值、直接打印未初始化的组数组。这也确认 `/etc/group` 内容是正确的（`caos:x:1000:`），问题不在账户文件。
+
+加上 musl 补丁并完整重建后，同样的 QEMU 启动与操作：
+
+```text
+# id caos; echo ID_RC=$?
+uid=1000(caos) gid=1000(caos) groups=1000(caos)
+ID_RC=0
+# su -s /bin/sh caos -c 'id'; echo SU_C_RC=$?
+uid=1000(caos) gid=1000(caos) groups=1000(caos)
+SU_C_RC=0
+# su -s /bin/sh caos -c 'caos-ca --version'; echo SU_VER_RC=$?
+caos-ca 0.1.0
+SU_VER_RC=0
+# su -s /bin/sh caos -c 'echo HOME=$HOME; id -u; id -g'; echo SU_ENV_RC=$?
+HOME=/mnt/ca-data
+1000
+1000
+SU_ENV_RC=0
+# echo exit | su -s /bin/sh caos; echo SU_INTERACTIVE_RC=$?
+SU_INTERACTIVE_RC=0
+```
+
+即：补充组集合、HOME、uid/gid 切换都正确，`-c` 单命令形式与交互 shell 形式都可用，`S20caos-ca` 的 `su ... -c "caos-ca verify"` 也不再因 `su` 失败而误报完整性校验失败。完整串口记录见 [su-fix.log](output/verification/su-fix.log)。
+
+构建期守卫在 `build.sh` Stage 4：
+
+```text
+[CAOS] musl getgrouplist()/initgroups() work without socket syscalls (.../musl-1.2.6/src/passwd/nscd_query.c)
+```
+
 
 ## 9. 已知限制
 
@@ -861,6 +935,8 @@ runtime_dir = "/run/caos-ca"
 | 串口无输出 | 115200 8N1；确认 `console=ttyS0,115200` 生效；检查 ttyS0 电平/适配器 |
 | 启动后没有 `/mnt/ca-data` | 查看 `S10caos-data` console 输出；确认 p3 已 LUKS2 格式化并 ext4 |
 | `caos-ca` 报时钟错误 | RTC 时间早于二进制构建时间；在固件设置或 console 设置正确时间后重试 |
+| `su -s /bin/sh caos` 报 `su: can't set groups: Function not implemented` | `CONFIG_NET=n` 让 `socket(2)` 返回 `ENOSYS`，而 musl 的 `getgrouplist()` 只容忍 `EAFNOSUPPORT`。确认 `BR2_GLOBAL_PATCH_DIR` 生效、`output/build/musl-*/src/passwd/nscd_query.c` 含 `|| errno == ENOSYS`（见 6.1），然后重建 |
+| `id caos` 打印一长串错误/重复的组 ID | 同上：`getgrouplist()` 失败后 BusyBox 会打印未初始化的组数组，这个现象随 musl 补丁一起消失 |
 | `caos-ca verify` 失败 | 先读具体错误；检查 CA 数据、审计链、证书/私钥权限和系统时间；不要继续签发直到修复 |
 | `caos-ca` 报 `mlock` 失败 | 当前 `RLIMIT_MEMLOCK` 太小；在 init/服务环境提高 `ulimit -l`（建议至少 64 KiB） |
 

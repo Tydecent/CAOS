@@ -241,6 +241,19 @@ if grep -q -- '--with-crypto_backend=kernel' "$CRYPTSETUP_CONFIG_LOG"; then
 fi
 echo "[CAOS] cryptsetup userspace crypto backend verified (gcrypt)"
 
+# musl's getgrouplist() first probes nscd over an AF_UNIX socket.  CONFIG_NET=n
+# removes every socket syscall (they return ENOSYS), and stock musl only
+# tolerates EAFNOSUPPORT, so initgroups() failed and `su caos` died with
+# "can't set groups: Function not implemented".  The BR2_GLOBAL_PATCH_DIR patch
+# must be visible in the musl tree that was actually built.
+MUSL_NSCD_QUERY="$(find "$OUTPUT_DIR/build" -maxdepth 6 -type f \
+    -path '*/musl-*/src/passwd/nscd_query.c' -print -quit)"
+[ -n "$MUSL_NSCD_QUERY" ] \
+    || fail "no musl src/passwd/nscd_query.c found under $OUTPUT_DIR/build"
+grep -q 'EAFNOSUPPORT || errno == ENOSYS' "$MUSL_NSCD_QUERY" \
+    || fail "musl does not treat a missing socket syscall as 'no nscd': $MUSL_NSCD_QUERY"
+echo "[CAOS] musl getgrouplist()/initgroups() work without socket syscalls ($MUSL_NSCD_QUERY)"
+
 UNSQUASH_LIST="$OUTPUT_DIR/unsquashfs-list.txt"
 unsquashfs -l "$ROOTFS_IMAGE" >"$UNSQUASH_LIST"
 grep -q '^squashfs-root/usr/bin/caos-ca$' "$UNSQUASH_LIST" \

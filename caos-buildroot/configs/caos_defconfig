@@ -14,6 +14,15 @@ BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_18=y
 # Prefer the official Buildroot source mirror, then fall back to upstream.
 BR2_PRIMARY_SITE="https://sources.buildroot.net"
 
+# --- Local patches ---------------------------------------------------------
+# musl's getgrouplist()/initgroups() probe nscd over an AF_UNIX socket.  With
+# CONFIG_NET=n every socket syscall is stubbed out and fails with ENOSYS, while
+# stock musl only tolerates EAFNOSUPPORT, so initgroups() fails and BusyBox
+# `su` dies with "can't set groups: Function not implemented".  The patch makes
+# ENOSYS mean "no nscd" too.  See:
+# board/caos/patches/musl/0001-nscd_query-treat-ENOSYS-as-no-nscd.patch
+BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_CAOS_PATH)/board/caos/patches"
+
 # --- Generic system settings ----------------------------------------------
 BR2_TARGET_GENERIC_HOSTNAME="caos"
 BR2_TARGET_GENERIC_ISSUE="CAOS - Air-Gapped Certificate Authority"
