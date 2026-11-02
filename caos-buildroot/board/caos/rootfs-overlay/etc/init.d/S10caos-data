@@ -19,6 +19,26 @@ log() {
     echo "CAOS[data]: $*"
 }
 
+data_mount_is_read_only() {
+    awk -v mount="$DATA_MOUNT" '
+        $2 == mount {
+            count = split($4, options, ",")
+            for (i = 1; i <= count; i++) {
+                if (options[i] == "ro") {
+                    found = 1
+                }
+            }
+        }
+        END { exit !found }
+    ' /proc/mounts 2>/dev/null
+}
+
+report_read_only_mount() {
+    log "$DATA_MOUNT is mounted read-only; CA write operations are unavailable."
+    log "Do not initialize or modify CA data. Check kernel messages and storage health."
+    log "If ext4 reports errors, back up the data before unmounting and checking it with e2fsck."
+}
+
 # Locate util-linux binaries explicitly where possible.  The image contains
 # both BusyBox applets and util-linux; the latter are preferred for blkid and
 # findfs because the CAOSDATA GPT partition label is resolved there.
@@ -123,6 +143,10 @@ fi
 ensure_device_mapper_control
 
 if grep -q " $DATA_MOUNT " /proc/mounts 2>/dev/null; then
+    if data_mount_is_read_only; then
+        report_read_only_mount
+        exit 0
+    fi
     chown caos:caos "$DATA_MOUNT"
     chmod 0700 "$DATA_MOUNT"
     log "$DATA_MOUNT is already mounted."
@@ -182,6 +206,11 @@ fi
 if ! mount -t ext4 -o rw,nodev,nosuid,noexec "$MAPPER_DEV" "$DATA_MOUNT"; then
     print_filesystem_instructions
     cryptsetup close "$MAPPER" >/dev/null 2>&1 || true
+    exit 0
+fi
+
+if data_mount_is_read_only; then
+    report_read_only_mount
     exit 0
 fi
 

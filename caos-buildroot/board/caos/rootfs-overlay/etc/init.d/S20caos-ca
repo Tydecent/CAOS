@@ -32,6 +32,22 @@ if ! grep -q " $DATA_MOUNT " /proc/mounts 2>/dev/null; then
     exit 0
 fi
 
+if awk -v mount="$DATA_MOUNT" '
+    $2 == mount {
+        count = split($4, options, ",")
+        for (i = 1; i <= count; i++) {
+            if (options[i] == "ro") {
+                found = 1
+            }
+        }
+    }
+    END { exit !found }
+' /proc/mounts 2>/dev/null; then
+    echo "CAOS: encrypted CA data is mounted read-only; skipping CA verification."
+    echo "CAOS: do not run CA write operations; check S10caos-data and kernel storage errors."
+    exit 0
+fi
+
 if [ ! -x "$CAOS_CA" ]; then
     echo "CAOS: $CAOS_CA is missing from the image."
     exit 0
