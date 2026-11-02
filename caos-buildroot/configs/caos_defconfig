@@ -60,6 +60,10 @@ BR2_TARGET_GRUB2_BUILTIN_CONFIG_EFI="$(BR2_EXTERNAL_CAOS_PATH)/board/caos/grub-b
 # --- Target userspace ------------------------------------------------------
 BR2_PACKAGE_BUSYBOX=y
 BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_CAOS_PATH)/board/caos/busybox.fragment"
+# cryptsetup must use a userspace crypto backend: CONFIG_NET=n removes AF_ALG,
+# and the "kernel" backend cannot initialize without the crypto user API.
+# Buildroot picks gcrypt because OpenSSL is not selected.
+BR2_PACKAGE_LIBGCRYPT=y
 BR2_PACKAGE_CRYPTSETUP=y
 BR2_PACKAGE_E2FSPROGS=y
 BR2_PACKAGE_UTIL_LINUX=y

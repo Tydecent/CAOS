@@ -5,7 +5,7 @@ CAOS 是一个可烧录到 x86_64 机器（SD 卡 / USB / 磁盘）的气隙证�
 - `caos-ca`：使用 Rust 编写的命令行 CA 工具，提供根 CA / 中间 CA 初始化、终端证书签发、列表、吊销与完整性校验。最终产物是静态链接的 `x86_64-unknown-linux-musl` ELF。
 - Buildroot 镜像：64 MiB FAT32 EFI System Partition（ESP）+ 只读 squashfs 根文件系统 + 预留的 LUKS2 数据分区；标准 GPT、纯 x86_64 UEFI（GRUB EFI）启动，不支持 Legacy BIOS/CSM。内核关闭整个网络栈，rootfs 不含网络客户端或远程登录服务。
 
-> **验证范围：本镜像已在 QEMU/OVMF 中完成 UEFI 启动验证**，串口和图形 console 均到达 `caos login:`；**尚未在真实目标硬件上启动**。第 8.5 节记录 QEMU 启动证据，第 9 节列出真机仍需确认的限制。
+> **验证范围：本镜像已在 QEMU/OVMF 中完成 UEFI 启动和 LUKS2 格式化/打开验证**，串口和图形 console 均到达 `caos login:`，`cryptsetup luksFormat`/`luksOpen` 成功；**尚未在真实目标硬件上启动**。第 8.5 节记录 QEMU 证据，第 9 节列出真机仍需确认的限制。
 
 ---
 
@@ -554,7 +554,8 @@ print(f"OK: {n} audit records, tip={prev}")
 
 - 首次迁移构建清空 `output/build`、`output/host`、`output/images`、`output/.config` 等全部构建状态（保留 `output/dl` 下载缓存），清理 Rust target 后，以 `JOBS=8 ./build.sh` 重新构建；Stage 5 于 `20:36` 成功。
 - 修复 UEFI framebuffer console 时，在 `linux.fragment` 增加 `DRM_FBDEV_EMULATION`/`simpledrm`/`fbcon` 后，以 `JOBS=8 ./build.sh` 增量重建；内核和镜像于 `20:49` 重新生成，Rust/工具链/GRUB 复用已构建结果。
-- 两次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
+- 修复 LUKS2 初始化时，在 `caos_defconfig` 增加 `BR2_PACKAGE_LIBGCRYPT=y` 并清理重建 `cryptsetup`；`09:51` 重新生成 rootfs 和 `sdcard.img`。
+- 三次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
 - `output/build.log` 的错误扫描：
 
 ```text
@@ -618,6 +619,7 @@ $ grep -nE '^(CONFIG_(DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFF
 - `CONFIG_MODULES=n` 时 `STRICT_MODULE_RWX` 符号本身被隐藏，最终 `.config` 仅保留 `CONFIG_ARCH_HAS_STRICT_MODULE_RWX=y`；需求强制片段中已经包含 `CONFIG_STRICT_MODULE_RWX=y`。
 - 最终 `.config` 中网络启用符号数量为 0。
 - 显示控制台不再依赖传统 VGA 文本模式。UEFI 只提供 GOP framebuffer，因此启用 `CONFIG_DRM_FBDEV_EMULATION=y`、`CONFIG_DRM_SIMPLEDRM=y`、`CONFIG_SYSFB_SIMPLEFB=y`、`CONFIG_FRAMEBUFFER_CONSOLE=y` 和 `CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y`；`CONFIG_FB` 仍为 `n`，由 DRM fbdev 提供 `fb0`/`fbcon`。
+- **LUKS2 不能使用 cryptsetup 的 kernel crypto backend。** `CONFIG_NET=n` 后，`CRYPTO_USER_API_HASH`/`CRYPTO_USER_API_SKCIPHER` 等 AF_ALG 接口被隐藏，`cryptsetup` 初始化 kernel backend 时 `socket(AF_ALG)` 失败，表现为 `Cannot initialize crypto backend` / `Failed to set pbkdf parameters`。因此 defconfig 增加 `BR2_PACKAGE_LIBGCRYPT=y`，Buildroot 的 cryptsetup 配置为 `--with-crypto_backend=gcrypt`，Argon2 仍由 `libargon2` 提供；内核侧 `CONFIG_DM_CRYPT=y`、`CONFIG_CRYPTO_AES=y`、`CONFIG_CRYPTO_XTS=y` 负责挂载后的 dm-crypt 数据路径。`build.sh` 同时检查这三个内核选项和 cryptsetup 的 gcrypt 配置，防止回退到需要 AF_ALG 的 kernel backend。
 - `CONFIG_EFI_PARTITION=y` 保证 `root=PARTLABEL=CAOSROOT` 能从标准 GPT 解析分区名；最终 `.config` 中 **只有** `CONFIG_EFI_PARTITION=y`，`# CONFIG_MSDOS_PARTITION is not set`，镜像不依赖 DOS/MBR 分区解析器。
 - 内核由 GRUB 的 `linux` 命令通过 Linux boot protocol 装载，不需要把 `bzImage` 当作 EFI 可执行文件直接启动；`CONFIG_EFI`/`CONFIG_EFI_STUB` 是 x86_64 defconfig 的既有设置，不是本启动链的额外依赖。
 
@@ -731,7 +733,8 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 使用宿主机 QEMU 10.2.1 + OVMF（edk2 `2025.11-3ubuntu7.3`）对最终 `sdcard.img` 做了多次纯 UEFI 启动：
 
 1. 将镜像作为 `qemu-xhci` 下的 `usb-storage` 设备，串口输出到文件，确认内核、USB 枚举、`PARTLABEL=CAOSROOT` 根挂载和 init 全流程；
-2. 关闭串口（`-serial none`），仅保留图形 framebuffer，确认本地屏幕能显示内核日志和 `caos login:`；再用 QEMU `sendkey` 从本地 console 输入 `root`，成功进入 root shell，证明 `tty1`/键盘输入链路也正常。
+2. 关闭串口（`-serial none`），仅保留图形 framebuffer，确认本地屏幕能显示内核日志和 `caos login:`；再用 QEMU `sendkey` 从本地 console 输入 `root`，成功进入 root shell，证明 `tty1`/键盘输入链路也正常；
+3. 在 `-snapshot` 临时镜像上，以 `/etc/hostname` 作为测试 key-file 执行 LUKS2 格式化、打开、`mkfs.ext4`、读写挂载、卸载和关闭，不写回最终镜像。
 
 关键日志：
 
@@ -744,13 +747,40 @@ squashfs 中同时确认存在：`/usr/bin/caos-ca`（root:root 0755）、`/etc/
 caos login:
 ```
 
+LUKS2 实测（QEMU 临时快照）：
+
+```text
+# cryptsetup luksFormat --type luks2 --label CAOSDATA --batch-mode --key-file /etc/hostname /dev/sda3
+# cryptsetup luksOpen --key-file /etc/hostname /dev/sda3 caos-data
+# cryptsetup status caos-data
+/dev/mapper/caos-data is active.
+  type:    LUKS2
+  cipher:  aes-xts-plain64
+  keysize: 512 [bits]
+  device:  /dev/sda3
+  mode:    read/write
+# cryptsetup isLuks /dev/sda3; echo isLuks_rc=$?
+isLuks_rc=0
+# mkfs.ext4 -L CAOS-DATA -F /dev/mapper/caos-data
+Creating filesystem with 114688 1k blocks and 28672 inodes
+# mount /dev/mapper/caos-data /mnt/ca-data
+EXT4-fs (dm-0): mounted filesystem ... r/w with ordered data mode.
+# df -h /mnt/ca-data
+/dev/mapper/caos-data    99.5M  46.0K  91.6M   0% /mnt/ca-data
+# umount /mnt/ca-data
+# cryptsetup close caos-data; echo close_rc=$?
+close_rc=0
+```
+
+完整 LUKS2 会话日志：[luks2-test.log](output/verification/luks2-test.log)。`luksFormat` 不再出现 `Cannot initialize crypto backend` 或 `Failed to set pbkdf parameters`，并完成 `mkfs.ext4`、读写挂载和卸载。
+
 图形 console 截图（QEMU，`-serial none`）：
 
 ![QEMU UEFI 启动后的本地 framebuffer console](output/verification/uefi-console-login.png)
 
 本地键盘登录后的 root shell：[uefi-console-root-shell.png](output/verification/uefi-console-root-shell.png)。
 
-完整串口日志保存在 `output/verification/qemu-boot-serial.log`。QEMU 验证覆盖 UEFI 固件→GRUB→内核→init→login 的启动链，但**不能替代目标机的 USB 控制器、GPU/固件和 Secure Boot 兼容性测试**。
+完整串口日志保存在 [luks2-test.log](output/verification/luks2-test.log)（包含本次启动和 LUKS2 会话）。QEMU 验证覆盖 UEFI 固件→GRUB→内核→init→login，以及 `cryptsetup` 的 LUKS2 格式化/打开，但**不能替代目标机的 USB 控制器、GPU/固件和 Secure Boot 兼容性测试**。
 
 ### 8.6 功能自测（宿主开发配置）
 
@@ -768,7 +798,7 @@ caos login:
 
 ## 9. 已知限制
 
-1. **未做真机启动测试。** 已在 QEMU/OVMF 中验证 UEFI→GRUB→内核→init→login，并确认本地 framebuffer console 可用（见 8.5）；但尚未在真实目标硬件上验证 USB 控制器、GPU/固件差异、LUKS 交互和长时间运行。首次真机启动仍需按第 4 节执行。
+1. **未做真机启动测试。** 已在 QEMU/OVMF 中验证 UEFI→GRUB→内核→init→login、本地 framebuffer console，以及 LUKS2 `luksFormat`/`luksOpen`/`close`（见 8.5）；但尚未在真实目标硬件上验证 USB 控制器、GPU/固件差异和长时间运行。首次真机启动仍需按第 4 节执行。
 2. **p3 必须首次手工格式化。** 镜像构建阶段和 `S10caos-data` 都不会自动调用 `luksFormat`。如果不做这一步，系统仍可启动，但没有 CA 数据分区可用。
 3. **仅支持 x86_64 UEFI，无 Legacy/CSM 回退。** 目标固件必须从 GPT ESP 启动；本镜像不包含 BIOS 引导代码、SYSLINUX/extlinux 或 hybrid MBR 启动项。UEFI Secure Boot 也没有配置签名，测试/部署时需要在固件中关闭 Secure Boot，或自行完成 GRUB 与内核的签名及密钥管理。部分固件若不自动使用可移动介质默认路径，需要在一次性启动菜单中手工选择 `UEFI: <介质名>`。
 4. **Console root 密码默认空。** 这是 Buildroot 默认行为。由于根文件系统只读，运行时 `passwd` 不能持久保存；生产镜像应在构建时通过 `BR2_TARGET_GENERIC_ROOT_PASSWD` 设置 root hash，或限制物理接触并用机柜锁/受控维护流程。当前镜像的 `/etc/motd` 和 `S20caos-ca` 会打印警告。
@@ -819,6 +849,7 @@ runtime_dir = "/run/caos-ca"
 | 固件报 Secure Boot violation | 本镜像未签名；关闭 Secure Boot，或自行签名 GRUB/内核并管理密钥 |
 | GRUB 找不到 `CAOSBOOT` 或 `grub.cfg` | 重新写盘；用 `validate-image.py` 检查 p1 类型、FAT32 卷标与 `\EFI\BOOT\grub.cfg` 是否存在 |
 | 屏幕停在 `Booting ...`，但 U 盘灯已灭 | 先接串口：若串口已到 `caos login:`，说明系统已启动，缺的是本地 framebuffer console；确认内核含 8.3 的 DRM/fbcon 选项。若串口停在 `Waiting for root device`，检查 USB 控制器/端口/存储设备 |
+| `cryptsetup` 报 `Cannot initialize crypto backend` / `Failed to set pbkdf parameters` | 说明 cryptsetup 用了 kernel/AF_ALG 后端，但 `CONFIG_NET=n` 下 AF_ALG 不存在；确认 `BR2_PACKAGE_LIBGCRYPT=y` 且 cryptsetup 配置为 `--with-crypto_backend=gcrypt`（见 8.3），再重建 |
 | 串口无输出 | 115200 8N1；确认 `console=ttyS0,115200` 生效；检查 ttyS0 电平/适配器 |
 | 启动后没有 `/mnt/ca-data` | 查看 `S10caos-data` console 输出；确认 p3 已 LUKS2 格式化并 ext4 |
 | `caos-ca` 报时钟错误 | RTC 时间早于二进制构建时间；在固件设置或 console 设置正确时间后重试 |

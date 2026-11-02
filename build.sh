@@ -197,6 +197,12 @@ grep -qx 'CONFIG_EFI_PARTITION=y' "$KERNEL_CONFIG" \
     || fail "$KERNEL_CONFIG does not contain CONFIG_EFI_PARTITION=y"
 grep -qx '# CONFIG_MSDOS_PARTITION is not set' "$KERNEL_CONFIG" \
     || fail "$KERNEL_CONFIG does not contain '# CONFIG_MSDOS_PARTITION is not set'"
+# dm-crypt/AES-XTS are needed to mount CAOSDATA after cryptsetup opens it.
+for option in CONFIG_DM_CRYPT=y CONFIG_CRYPTO_AES=y CONFIG_CRYPTO_XTS=y; do
+    grep -qx "$option" "$KERNEL_CONFIG" \
+        || fail "$KERNEL_CONFIG does not contain $option"
+done
+echo "[CAOS] kernel dm-crypt/AES-XTS policy verified in $KERNEL_CONFIG"
 # UEFI provides a GOP framebuffer, not VGA text mode.  Without fbcon the kernel
 # runs but the screen stays on GRUB's last line.  Keep a DRM fbdev console.
 for option in \
@@ -210,6 +216,20 @@ do
         || fail "$KERNEL_CONFIG does not contain $option"
 done
 echo "[CAOS] kernel air-gap, GPT-only and UEFI fbcon policy verified in $KERNEL_CONFIG"
+
+# cryptsetup's "kernel" backend uses AF_ALG, which does not exist with
+# CONFIG_NET=n.  It must be built against a userspace backend (gcrypt here),
+# otherwise luksFormat fails with "Cannot initialize crypto backend".
+CRYPTSETUP_CONFIG_LOG="$(find "$OUTPUT_DIR/build" -maxdepth 2 -type f \
+    -path '*/cryptsetup-*/config.log' -print -quit)"
+[ -n "$CRYPTSETUP_CONFIG_LOG" ] \
+    || fail "no cryptsetup config.log found under $OUTPUT_DIR/build"
+grep -q -- '--with-crypto_backend=gcrypt' "$CRYPTSETUP_CONFIG_LOG" \
+    || fail "cryptsetup was not configured with the gcrypt backend: $CRYPTSETUP_CONFIG_LOG"
+if grep -q -- '--with-crypto_backend=kernel' "$CRYPTSETUP_CONFIG_LOG"; then
+    fail "cryptsetup still uses the kernel crypto backend, which requires AF_ALG/NET"
+fi
+echo "[CAOS] cryptsetup userspace crypto backend verified (gcrypt)"
 
 UNSQUASH_LIST="$OUTPUT_DIR/unsquashfs-list.txt"
 unsquashfs -l "$ROOTFS_IMAGE" >"$UNSQUASH_LIST"
@@ -261,8 +281,9 @@ echo "[CAOS] no forbidden network commands in rootfs"
     echo "caos-ca file(1): $FILE_OUTPUT"
     echo
     echo "kernel config: $KERNEL_CONFIG"
-    grep -E '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set|CONFIG_(STRICT_KERNEL_RWX|STRICT_MODULE_RWX|RANDOMIZE_BASE|EFI_PARTITION|DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFFER_CONSOLE|FRAMEBUFFER_CONSOLE_DETECT_PRIMARY)=y)$' \
+    grep -E '^(# CONFIG_(NET|INET|IPV6|PACKET|MODULES|MSDOS_PARTITION) is not set|CONFIG_(STRICT_KERNEL_RWX|STRICT_MODULE_RWX|RANDOMIZE_BASE|EFI_PARTITION|DM_CRYPT|CRYPTO_AES|CRYPTO_XTS|DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFFER_CONSOLE|FRAMEBUFFER_CONSOLE_DETECT_PRIMARY)=y)$' \
         "$KERNEL_CONFIG" || true
+    echo "cryptsetup crypto backend: gcrypt (userspace; AF_ALG is unavailable with CONFIG_NET=n)"
     echo
     echo "GPT/ESP layout validation:"
     cat "$OUTPUT_DIR/verification/image-layout.txt"
