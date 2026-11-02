@@ -167,27 +167,16 @@ EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假
 
 ## 3. 烧录
 
-> **警告：下面的 `of=` 设备名只是占位符。写错设备会不可恢复地摧毁该磁盘/系统盘上的数据。** 执行前用 `lsblk`、设备容量和 `dmesg` 三重确认目标设备。
+> **警告：写错设备会覆盖该磁盘上的数据。** 擦除模式会重写整盘；烧录前用 `lsblk` 核对设备名、容量和型号，并备份证书数据。
 
-镜像大小约 321 MiB。目标介质必须不小于镜像；更大的 SD 卡可以写入，镜像不会自动占满剩余空间。
+镜像大小约 321 MiB。先用 `lsblk` 确认设备名；烧录脚本要求设置整盘设备环境变量，不要指定 `/dev/sdX1` 这类分区：
 
 ```bash
-# 先确认目标设备，例如 /dev/sdX 或 /dev/mmcblk0
 lsblk -o NAME,SIZE,MODEL,TRAN
-
-# 卸载目标设备上的所有分区（如已挂载）
-sudo umount /dev/sdX* 2>/dev/null || true
-
-# 写入；of= 必须替换为确认过的目标设备，不是分区，也不是系统盘
-sudo dd if=output/images/sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress
-sync
+sudo env CAOS_DEVICE=/dev/sdX ./flash.sh
 ```
 
-不要对 `/dev/sdX1` 这种分区写入整个磁盘镜像，也不要省略 `conv=fsync` 后立刻拔卡。写完后可以让内核重新读取分区表：
-
-```bash
-sudo blockdev --rereadpt /dev/sdX
-```
+脚本默认使用 `output/images/sdcard.img`，也可用 `CAOS_IMAGE` 指定其他镜像。检测到已有 `CAOSDATA` 证书数据分区时，会询问保留、擦除或取消：选择保留只更新 ESP 和根文件系统，GPT 与 CAOSDATA 不会被写入；选择擦除会重写整盘并清空 CAOSDATA。脚本还会要求再次输入目标设备路径确认。烧录后安全弹出介质再拔出。
 
 镜像只支持 **x86_64 UEFI**。目标机需要关闭 Legacy/CSM（或设置为 UEFI-only），并从这张 GPT 介质的 ESP 启动。固件应能识别标准可移动介质路径 `\EFI\BOOT\BOOTX64.EFI`；不同厂商固件通常在启动菜单中显示为 `UEFI: <介质名>`，若默认启动顺序没有选中它，请在一次性 Boot Menu 中手工选择，或用固件设置把它加入启动顺序。镜像没有 BIOS、PXE 或网络启动路径。
 
