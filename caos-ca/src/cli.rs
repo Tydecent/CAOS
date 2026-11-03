@@ -7,7 +7,7 @@ use crate::config::DEFAULT_CONFIG_PATH;
 #[derive(Debug, Parser)]
 #[command(
     name = "caos-ca",
-    version,
+    version = crate::commands::version(),
     about = "CAOS air-gapped certificate authority management tool"
 )]
 pub struct Cli {

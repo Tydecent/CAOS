@@ -5,7 +5,7 @@ CAOS 是一个可烧录到 x86_64 机器（SD 卡 / USB / 磁盘）的气隙证�
 - `caos-ca`：使用 Rust 编写的命令行 CA 工具，提供根 CA / 中间 CA 初始化、终端证书签发、列表、吊销与完整性校验。最终产物是静态链接的 `x86_64-unknown-linux-musl` ELF。
 - Buildroot 镜像：64 MiB FAT32 EFI System Partition（ESP）+ 只读 squashfs 根文件系统 + 预留的 LUKS2 数据分区；标准 GPT、纯 x86_64 UEFI（GRUB EFI）启动，不支持 Legacy BIOS/CSM。内核关闭整个网络栈，rootfs 不含网络客户端或远程登录服务。
 
-> **验证范围：本镜像已在 QEMU/OVMF 中完成 UEFI 启动和 LUKS2 格式化/打开验证**，串口和图形 console 均到达 `caos login:`，`cryptsetup luksFormat`/`luksOpen` 成功；**尚未在真实目标硬件上启动**。第 8.5 节记录 QEMU 证据，第 9 节列出真机仍需确认的限制。
+> **验证范围：本镜像已在 QEMU/OVMF 中完成 UEFI 启动和 LUKS2 格式化/打开验证**，串口和图形 console 均到达 `caos login:`，`cryptsetup luksFormat`/`luksOpen` 成功；在大部分真实硬件上测试成功。已知在华硕系列的部分笔记本电脑上无法启动。
 
 ---
 
@@ -118,7 +118,6 @@ Buildroot 会自行构建 host 工具（host-genimage、host-mtools、host-dosfs
 ### 2.3 一键构建
 
 ```bash
-cd project
 ./build.sh
 ```
 
@@ -130,7 +129,7 @@ cd project
 4. 执行完整 Buildroot 构建（大阶段，耗时最长）；
 5. 验证标准 GPT/ESP 分区表、`\EFI\BOOT\BOOTX64.EFI` 默认启动路径、GRUB 命令行、内核 `CONFIG_NET`/GPT 设置、`rootfs.squashfs` 与镜像内文件，并打印产物大小。
 
-预计耗时：在 24 核机器上，首次构建（含下载、工具链、内核、squashfs、镜像）通常需要 **约 15–40 分钟**，主要取决于网络、内存与 CPU。增量构建会快很多。本次保留 `output/dl` 下载缓存、清空其余构建输出后，以 `JOBS=8` 完整重跑；Buildroot 全部目标包、内核、GRUB EFI、squashfs、ESP 和 GPT 镜像均重新生成，从 20:15 到最终镜像完成约 **21 分钟**。实测数据见第 8 节。
+预计耗时：在 24 核机器上，首次构建（含下载、工具链、内核、squashfs、镜像）通常需要 **约 15–40 分钟**，主要取决于网络、内存与 CPU。增量构建会快很多。实测数据见第 8 节。
 
 产物：
 
@@ -248,7 +247,7 @@ chmod 0700 /mnt/ca-data
 
 如果 `luksFormat` 已完成但还没有 ext4，S10 会提示执行 `mkfs.ext4`，仍然不会自动格式化。镜像使用 devtmpfs 而没有 udev，`cryptsetup` 打开映射后 S10 会调用 `dmsetup mknodes`；如果 `/dev/mapper/caos-data` 仍不存在，会按 sysfs 中的 dm 名称回退到 `/dev/dm-N`。格式化并重启后，**每次启动**都会在 getty 出现前要求输入 LUKS passphrase；这是有意设计，系统没有网络远程解锁路径。
 
-**立即备份 LUKS header**（在任意可信主机上把 p3 设备/镜像接入后执行；不要和 CA 数据放在同一介质）：
+**备份 LUKS header**（在任意可信主机上把 p3 设备/镜像接入后执行；不要和 CA 数据放在同一介质）：
 
 ```bash
 cryptsetup luksHeaderBackup /dev/sdX3 \
@@ -301,7 +300,20 @@ su -l -s /bin/sh caos
 
 # 工具默认读取 /etc/caos-ca/config.toml
 caos-ca --help
+
+# 查看版本（-V 与 --version 等价，不需要可读的数据分区或配置文件）
+caos-ca -V
 ```
+
+`-V` 输出构建身份，格式为 `<Git Tag> Commit <7 位提交哈希> (<构建时间>)`：
+
+```text
+caos-ca v0.1.0 Commit c33f14a (2026-11-03T15:17:31Z)
+```
+
+- 构建时 `HEAD` 上有 Git tag 才输出 tag，否则整段省略；
+- 源码树没有 Git 元数据（例如从导出源码包构建）时省略 `Commit <hash>`；
+- 构建时间始终输出，为 `build.rs` 记录的 UTC 时间（RFC 3339）。
 
 数据目录契约（固定）：
 

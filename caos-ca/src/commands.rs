@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
@@ -22,6 +23,55 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Revoke { serial } => revoke(&config, &serial),
         Command::Verify => run_verify(&config),
     }
+}
+
+// Version identity reported by `caos-ca --version`.
+//
+// Format: `<Git Tag> Commit <7-hex commit> (<Build Time>)`, where the tag is
+// omitted when `HEAD` is not tagged and the commit is omitted when the binary
+// was built without Git metadata (for example from an exported source tree).
+// The build time is always present and formatted as RFC 3339 in UTC.
+
+/// The build identity, computed once and reused for every call.
+pub fn version() -> &'static str {
+    static VERSION: OnceLock<String> = OnceLock::new();
+    VERSION
+        .get_or_init(|| render(git_tag(), git_commit(), &build_time()))
+        .as_str()
+}
+
+/// Assemble the human-readable identity, skipping empty components.
+fn render(tag: Option<&str>, commit: Option<&str>, build_time: &str) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if let Some(tag) = tag.filter(|tag| !tag.is_empty()) {
+        parts.push(tag.to_string());
+    }
+    if let Some(commit) = commit.filter(|commit| !commit.is_empty()) {
+        parts.push(format!("Commit {commit}"));
+    }
+    parts.push(format!("({build_time})"));
+    parts.join(" ")
+}
+
+/// The tag on `HEAD` recorded by `build.rs`, when there was one.
+fn git_tag() -> Option<&'static str> {
+    option_env!("CAOS_BUILD_GIT_TAG")
+}
+
+/// The short commit hash recorded by `build.rs`, when Git was available.
+fn git_commit() -> Option<&'static str> {
+    option_env!("CAOS_BUILD_GIT_COMMIT")
+}
+
+/// The compile-time timestamp as RFC 3339 UTC, falling back to the raw Unix
+/// seconds if it cannot be parsed or formatted.
+fn build_time() -> String {
+    let raw = env!("CAOS_BUILD_UNIX_TIME");
+    raw.parse::<i64>()
+        .ok()
+        .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .and_then(|moment| format_timestamp(moment).ok())
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn initialize(config: &Config) -> Result<()> {
@@ -157,4 +207,41 @@ fn truncate_display(value: &str, max_chars: usize) -> String {
     let mut result: String = value.chars().take(max_chars.saturating_sub(1)).collect();
     result.push('…');
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render;
+
+    #[test]
+    fn renders_tag_commit_and_build_time() {
+        assert_eq!(
+            render(Some("v1.2.3"), Some("0a1b2c3"), "2026-11-03T08:37:00Z"),
+            "v1.2.3 Commit 0a1b2c3 (2026-11-03T08:37:00Z)"
+        );
+    }
+
+    #[test]
+    fn omits_missing_tag() {
+        assert_eq!(
+            render(None, Some("0a1b2c3"), "2026-11-03T08:37:00Z"),
+            "Commit 0a1b2c3 (2026-11-03T08:37:00Z)"
+        );
+    }
+
+    #[test]
+    fn omits_missing_git_metadata() {
+        assert_eq!(
+            render(None, None, "2026-11-03T08:37:00Z"),
+            "(2026-11-03T08:37:00Z)"
+        );
+    }
+
+    #[test]
+    fn omits_empty_components() {
+        assert_eq!(
+            render(Some(""), Some(""), "2026-11-03T08:37:00Z"),
+            "(2026-11-03T08:37:00Z)"
+        );
+    }
 }
