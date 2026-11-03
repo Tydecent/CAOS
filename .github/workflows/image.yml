@@ -1,0 +1,145 @@
+# Buildroot Image — CAOS 气隙镜像全量构建与验收流水线
+#
+# 执行 build.sh 一键构建（README 2.3）：
+#   Stage 1  Rust 静态二进制 → rootfs overlay
+#   Stage 2  Buildroot caos_defconfig
+#   Stage 3  Buildroot 全量构建（长阶段）
+#   Stage 4  GPT/ESP/内核策略/rootfs 验收（validate-image.py 等）
+#   Stage 5  产物清点
+#
+# 触发策略说明：完整构建在 4 核 runner 上约 45–90 分钟，
+# 因此 pull_request 仅在构建相关路径变更时运行；
+# push 到主分支 / 打 tag / 手动触发均可全量构建。
+#
+# 产物：sdcard.img（GPT 镜像）、boot.vfat、rootfs.squashfs、bzImage
+# 以及 output/verification/ 验收摘要。
+
+name: Buildroot Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Buildroot 并行度 JOBS（默认 4，对应 4 vCPU runner）"
+        required: false
+        default: "4"
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+    paths:
+      - "caos-ca/**"
+      - "caos-buildroot/**"
+      - "build.sh"
+      - ".github/workflows/image.yml"
+  pull_request:
+    paths:
+      - "caos-ca/**"
+      - "caos-buildroot/**"
+      - "build.sh"
+      - ".github/workflows/image.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Buildroot 发布 tag（README 2.4 / 8.1：tag 2026.08.1，浅克隆）
+  BUILDROOT_VERSION: "2026.08.1"
+  # build.sh 通过 BUILDROOT_DIR 环境变量定位 Buildroot 源码树
+  BUILDROOT_DIR: ${{ github.workspace }}/../buildroot-2026.08.1
+  RUST_TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    name: build.sh (Rust + Buildroot + 镜像验收)
+    runs-on: ubuntu-latest
+    # 4 vCPU runner 上全量构建预计 45–90 分钟；上限放宽到 3 小时
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      # Buildroot 全量构建（工具链 + 内核 + 包 + 下载缓存）需要大量磁盘。
+      # GitHub 托管 runner 预装的 Android/.NET/GHC 等与本构建无关，先行清理。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/powershell /usr/share/swift || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install build dependencies (README 2.1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git wget curl cpio unzip rsync bc file \
+            python3 perl bison flex libncurses-dev libssl-dev \
+            musl-tools squashfs-tools
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: caos-ca
+          key: image-build
+
+      # build.sh 不含 cargo test；长构建之前先跑单元测试快速失败
+      - name: cargo test (quick gate before long build)
+        working-directory: caos-ca
+        run: cargo test --release --target "$RUST_TARGET"
+
+      - name: Clone Buildroot ${{ env.BUILDROOT_VERSION }} (shallow)
+        run: |
+          git clone --depth 1 --branch "$BUILDROOT_VERSION" \
+            https://github.com/buildroot/buildroot.git "$BUILDROOT_DIR"
+          git -C "$BUILDROOT_DIR" rev-parse --short HEAD
+
+      # Buildroot 下载缓存（源码镜像数百 MiB，跨构建复用）
+      - name: Cache Buildroot downloads (output/dl)
+        uses: actions/cache@v4
+        with:
+          path: output/dl
+          key: buildroot-dl-${{ env.BUILDROOT_VERSION }}-${{ hashFiles('caos-buildroot/configs/caos_defconfig') }}
+          restore-keys: |
+            buildroot-dl-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Build (build.sh)
+        run: |
+          echo "disk before build:"; df -h /
+          JOBS="${{ github.event.inputs.jobs || '4' }}" ./build.sh
+
+      # 构建日志/验收摘要：失败时同样保留，便于排查
+      - name: Upload verification & logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-and-verification
+          path: |
+            output/verification/
+            output/build.log
+            output/rust-build.log
+            output/clippy.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Checksums
+        run: |
+          cd output/images
+          sha256sum sdcard.img boot.vfat rootfs.squashfs bzImage | tee SHA256SUMS
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: caos-image
+          path: |
+            output/images/sdcard.img
+            output/images/boot.vfat
+            output/images/rootfs.squashfs
+            output/images/bzImage
+            output/images/SHA256SUMS
+          retention-days: 30

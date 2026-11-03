@@ -1,0 +1,172 @@
+# Rust CI — caos-ca 静态 CA 工具的构建与测试流水线
+#
+# 覆盖与 build.sh Stage 1 相同的验收项：
+#   - cargo fmt  --check          （格式）
+#   - cargo clippy -D warnings    （lint，与 build.sh 一致）
+#   - cargo test --release        （单元测试，musl 目标）
+#   - cargo build --release       （musl 静态二进制）
+#   - file(1) "statically linked" （静态链接验收，与 build.sh 一致）
+#   - MSRV 1.88 声明核验
+#   - cargo audit                 （依赖安全审计，气隙 CA 供应链）
+#
+# 所有 cargo 命令均针对 x86_64-unknown-linux-musl：
+# caos-ca/.cargo/config.toml 将默认 target 固定为 musl，
+# ring 的 C/汇编代码必须经 musl-gcc 编译（见 README 2.1）。
+
+name: Rust CI
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "caos-ca/**"
+      - ".github/workflows/rust-ci.yml"
+  pull_request:
+    paths:
+      - "caos-ca/**"
+      - ".github/workflows/rust-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  lint:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain (musl-gcc for ring)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: caos-ca
+          key: lint
+
+      - name: cargo fmt --check
+        working-directory: caos-ca
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        working-directory: caos-ca
+        run: cargo clippy --target "$RUST_TARGET" -- -D warnings
+
+  test:
+    name: Test & static build (musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain (musl-gcc for ring)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools file
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: caos-ca
+          key: test
+
+      - name: cargo test (release, musl)
+        working-directory: caos-ca
+        run: cargo test --release --target "$RUST_TARGET"
+
+      - name: cargo build (release, musl)
+        working-directory: caos-ca
+        run: cargo build --release --target "$RUST_TARGET"
+
+      - name: Verify statically linked ELF (build.sh Stage 1 验收)
+        working-directory: caos-ca
+        run: |
+          BIN="target/$RUST_TARGET/release/caos-ca"
+          ls -l "$BIN"
+          FILE_OUTPUT="$(file "$BIN")"
+          echo "$FILE_OUTPUT"
+          case "$FILE_OUTPUT" in
+            *"statically linked"*) ;;
+            *) echo "ERROR: caos-ca is not statically linked" >&2; exit 1 ;;
+          esac
+          sha256sum "$BIN"
+
+      - name: Upload caos-ca binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: caos-ca-musl-static
+          path: caos-ca/target/x86_64-unknown-linux-musl/release/caos-ca
+          retention-days: 14
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain (musl-gcc for ring)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # Cargo.toml 声明 rust-version = "1.88"
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: caos-ca
+          key: msrv-1.88
+
+      # dtolnay/rust-toolchain 会把安装的 toolchain 设为默认，直接 cargo check 即可
+      - name: cargo check (MSRV)
+        working-directory: caos-ca
+        run: cargo check --target "$RUST_TARGET"
+
+  audit:
+    name: Security audit (cargo-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo-audit binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}
+
+      - name: cargo audit
+        working-directory: caos-ca
+        run: |
+          command -v cargo-audit >/dev/null 2>&1 || cargo install cargo-audit --locked
+          cargo audit
