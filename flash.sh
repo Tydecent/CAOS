@@ -43,7 +43,7 @@ if [[ -n "$DATA_PARTITION" ]]; then
     printf '检测到证书数据分区：%s\n' "$DATA_PARTITION"
     printf '选择：保留 CAOSDATA（只更新系统），或擦除（重写整盘并清空 CAOSDATA）。\n'
     while true; do
-        read -r -p '请输入 [保留/擦除/取消]：' choice
+        read -r -p '请输入 [保留(k)/擦除(e)/取消(q)]：' choice
         case "$choice" in
             保留|keep|K|k) ACTION=keep; break ;;
             擦除|erase|E|e) ACTION=erase; break ;;
