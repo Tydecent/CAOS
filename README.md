@@ -938,6 +938,13 @@ SU_INTERACTIVE_RC=0
 - **可复现构建与供应链**：固定 Cargo.lock、Buildroot tag、源码哈希、SBOM、签名镜像与构建环境证明。
 - **更严格的时钟**：加入离线 RTC 漂移审计、启动时人工确认时间、防回拨策略；目前依赖固件 RTC 和编译期下限。
 
+## 法律与许可
+
+本项目原创代码、脚本、配置、补丁及文档均采用 GNU General Public License, version 2 only（GPL-2.0-only）授权，详见仓库根目录的 `LICENSE`。复制、修改或再分发这些内容时，须遵守该许可证的条款。
+
+构建镜像包含的 Buildroot、Linux、GRUB、BusyBox、musl、util-linux、cryptsetup 等第三方组件仍按各自许可证授权；本项目不改变其许可证。再分发镜像时，请一并遵守适用于各组件的版权声明、许可证文本及源码提供义务。
+
+本项目按 GPLv2 提供，不提供超出该许可证规定的保证；具体条款以 [LICENSE](./LICENSE) 为准。
 
 
 ## 附录 A：配置文件
@@ -969,8 +976,3 @@ runtime_dir = "/run/caos-ca"
 | `id caos` 打印一长串错误/重复的组 ID | 同上：`getgrouplist()` 失败后 BusyBox 会打印未初始化的组数组，这个现象随 musl 补丁一起消失 |
 | `caos-ca verify` 失败 | 先读具体错误；检查 CA 数据、审计链、证书/私钥权限和系统时间；不要继续签发直到修复 |
 | `caos-ca` 报 `mlock` 失败 | 当前 `RLIMIT_MEMLOCK` 太小；在 init/服务环境提高 `ulimit -l`（建议至少 64 KiB） |
-
-## 附录 C：许可
-
-- `caos-ca`：MIT OR Apache-2.0。
-- 集成树中的脚本与配置：随项目交付；Buildroot、GRUB、BusyBox、util-linux、cryptsetup 等第三方组件遵循各自上游许可。本工程不修改 Buildroot 源码树。

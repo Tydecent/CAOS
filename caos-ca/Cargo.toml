@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 description = "CAOS: an air-gapped certificate authority management tool"
-license = "MIT OR Apache-2.0"
+license = "GPLv2"
 
 [dependencies]
 argon2 = { version = "0.5.3", features = ["zeroize"] }
