@@ -7,7 +7,7 @@ CAOS 是一个可烧录到 x86_64 机器（SD 卡 / USB / 磁盘）的气隙证�
 
 > **验证范围：本镜像已在 QEMU/OVMF 中完成 UEFI 启动和 LUKS2 格式化/打开验证**，串口和图形 console 均到达 `caos login:`，`cryptsetup luksFormat`/`luksOpen` 成功；在大部分真实硬件上测试成功。已知在华硕系列的部分笔记本电脑上无法启动。
 
----
+
 
 ## 1. 项目结构
 
@@ -66,7 +66,7 @@ Buildroot 浅克隆 `../buildroot-2026.08.1/` 未做修改。下载目录通过 
 `output/images/sdcard.img` 使用**标准 GPT**，不再生成混合 MBR/GPT 启动布局。GPT 本身按规范在 LBA 0 写一个仅含 `0xEE` 保护项的保护性 MBR；它不是 BIOS 启动路径，前 440 字节没有引导代码、没有 active 分区，也不安装 SYSLINUX 或 BIOS MBR 引导代码。p1 的 GPT 类型是 EFI System Partition（`C12A7328-F81F-11D2-BA4B-00A0C93EC93B`），不是普通 FAT 基本数据分区。
 
 | 分区 | GPT 名称 / 文件系统 | 大小 | 内容 |
-|---|---|---|---|
+|||||
 | p1 | `CAOSBOOT`，FAT32 ESP | 64 MiB | `\EFI\BOOT\BOOTX64.EFI`、`\EFI\BOOT\grub.cfg`、`\zImage` |
 | p2 | `CAOSROOT`，squashfs | 128 MiB | 只读根文件系统 |
 | p3 | `CAOSDATA`，初始为空 | 128 MiB | **构建时留空**，首次启动手工 LUKS2 格式化 |
@@ -79,7 +79,7 @@ console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro
 
 p3 在镜像构建阶段不会运行 `luksFormat`。LUKS header 和 CA 私钥都不在 `sdcard.img` 中。`S10caos-data` 依靠 GPT 标签 `CAOSDATA` 定位它，这一首次启动流程没有改变。
 
----
+
 
 ## 2. 构建
 
@@ -167,7 +167,7 @@ EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假
 `.github/workflows/image.yml` 里配了两层 GitHub Actions 缓存，用来避免每次 push 都重跑 45–90 分钟的全量构建：
 
 | 缓存         | 路径               | 键                                                              | 作用                                    |
-| ---------- | ---------------- | -------------------------------------------------------------- | ------------------------------------- |
+| - | - | -- | - |
 | rust-cache | `caos-ca/target` | 由 `Swatinem/rust-cache` 按 `Cargo.lock` 管理                      | 复用 cargo 依赖与增量编译产物                    |
 | state      | `output/`（整棵）    | `br2-state-<schema>-<Buildroot 版本>-<构建输入指纹>-<工作目录指纹>-<run_id>` | 复用包 stamp、交叉工具链、已安装产物、源码包、内核与 GRUB 产物 |
 
@@ -188,7 +188,7 @@ EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假
 
 手动触发时可勾选 `disable_cache` 忽略全部缓存（排查"是不是缓存的锅"时用）；改 `CACHE_SCHEMA` 环境变量可一次性失效所有旧缓存。本地构建（`./build.sh`）本来就复用 `output/`，不需要额外开关。
 
----
+
 
 ## 3. 烧录
 
@@ -207,7 +207,7 @@ sudo env CAOS_DEVICE=/dev/sdX ./flash.sh
 
 > 当前 GRUB EFI 应用和内核都**没有做 UEFI Secure Boot 签名**。测试/部署时需在固件中关闭 Secure Boot，或后续自行完成签名与密钥管理；这属于已知限制，不是本镜像已实现的能力。
 
----
+
 
 ## 4. 首次启动
 
@@ -315,7 +315,7 @@ caos-ca verify
 - 把 **加密后的 `root-ca.key.enc`、`root-ca.crt`、`intermediate-ca.crt` 和 LUKS header 备份**分别保存到离线介质。根私钥密文与口令分开保管。
 - 本工具不做口令托管：忘记根 CA 口令 = 无法解开归档的根私钥；忘记 LUKS passphrase 且 header/密钥丢失 = CA 数据不可恢复。
 
----
+
 
 ## 5. 日常操作
 
@@ -451,7 +451,7 @@ Verification successful.
 
 任何一步失败都会输出非零退出码，并在 `caos-ca: error:` 后给出具体原因。
 
----
+
 
 ## 6. 安全说明
 
@@ -573,7 +573,7 @@ print(f"OK: {n} audit records, tip={prev}")
 - CA 工具以 `caos` 用户运行，不使用 root；
 - 控制台 root 账号的访问安全见“已知限制”。
 
----
+
 
 ## 7. Buildroot 定制要点
 
@@ -590,7 +590,7 @@ print(f"OK: {n} audit records, tip={prev}")
 - `board/caos/validate-image.py` 独立解析 GPT 头、主/备份分区数组、保护性 MBR、ESP FAT 标签和 CAOSDATA 空白状态，`build.sh` 在 Stage 4 调用它。
 - `BR2_GLOBAL_PATCH_DIR=board/caos/patches`：目前只有一个 musl 补丁（`nscd_query.c` 把 `ENOSYS` 也当作“没有 nscd”），用于让 `su`/`initgroups()` 在 `CONFIG_NET=n`（没有 `socket(2)`）的内核上工作。补丁仍留在外部树内，Buildroot 源码树依旧零修改。
 
----
+
 
 ## 8. 构建验证
 
@@ -780,7 +780,7 @@ squashfs-root/usr/bin/caos-ca
 
 $ unsquashfs -lln output/images/rootfs.squashfs | grep -E 'caos-ca|config.toml|mnt/ca-data'
 -r--r--r-- 0/0              245 ... squashfs-root/etc/caos-ca/config.toml
-drwx------ 1000/1000          3 ... squashfs-root/mnt/ca-data
+drwx 1000/1000          3 ... squashfs-root/mnt/ca-data
 -rwxr-xr-x 0/0          2183696 ... squashfs-root/usr/bin/caos-ca
 ```
 
@@ -923,7 +923,7 @@ SU_INTERACTIVE_RC=0
 12. **没有做过性能/并发压力测试。** 审计追加前会全量校验链，超大日志下签发/吊销会变慢。
 13. **初始化/签发/吊销不是跨文件事务。** 如果磁盘写满、断电或权限错误发生在多文件更新之间，可能留下部分已写文件或清单/审计不一致；`verify` 会检测出来，但恢复通常需要人工清理/恢复备份。生产部署应把数据分区放在可靠的存储上并使用 LUKS header 与数据库备份。
 
----
+
 
 ## 10. 后续加固建议（未实现）
 
@@ -938,7 +938,7 @@ SU_INTERACTIVE_RC=0
 - **可复现构建与供应链**：固定 Cargo.lock、Buildroot tag、源码哈希、SBOM、签名镜像与构建环境证明。
 - **更严格的时钟**：加入离线 RTC 漂移审计、启动时人工确认时间、防回拨策略；目前依赖固件 RTC 和编译期下限。
 
----
+
 
 ## 附录 A：配置文件
 
@@ -955,7 +955,7 @@ runtime_dir = "/run/caos-ca"
 ## 附录 B：启动命令与故障排查
 
 | 现象 | 检查 |
-|---|---|
+|||
 | 无法从 SD 卡启动 | 确认固件为 UEFI-only、已关闭 CSM/Secure Boot；确认 `dd` 写的是整盘而不是分区；在 Boot Menu 选择 `UEFI: <介质名>`；检查 p1 是否为 EFI System Partition 且包含 `\EFI\BOOT\BOOTX64.EFI` |
 | 固件报 Secure Boot violation | 本镜像未签名；关闭 Secure Boot，或自行签名 GRUB/内核并管理密钥 |
 | GRUB 找不到 `CAOSBOOT` 或 `grub.cfg` | 重新写盘；用 `validate-image.py` 检查 p1 类型、FAT32 卷标与 `\EFI\BOOT\grub.cfg` 是否存在 |
