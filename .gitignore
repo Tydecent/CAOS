@@ -7,7 +7,7 @@
 # Python bytecode
 __pycache__/
 
-# Generated Rust binary copied into the rootfs overlay by build.sh
+# Generated Rust binary copied into the rootfs overlay by manage.sh build
 /caos-buildroot/board/caos/rootfs-overlay/usr/bin/caos-ca
 
 # Local editor and operating-system files

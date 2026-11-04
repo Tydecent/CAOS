@@ -1,11 +1,11 @@
 # Rust CI — caos-ca 静态 CA 工具的构建与测试流水线
 #
-# 覆盖与 build.sh Stage 1 相同的验收项：
+# 覆盖与 manage.sh build Stage 1 相同的验收项：
 #   - cargo fmt  --check          （格式）
-#   - cargo clippy -D warnings    （lint，与 build.sh 一致）
+#   - cargo clippy -D warnings    （lint，与 manage.sh build 一致）
 #   - cargo test --release        （单元测试，musl 目标）
 #   - cargo build --release       （musl 静态二进制）
-#   - file(1) "statically linked" （静态链接验收，与 build.sh 一致）
+#   - file(1) "statically linked" （静态链接验收，与 manage.sh build 一致）
 #   - MSRV 1.88 声明核验
 #   - cargo audit                 （依赖安全审计，气隙 CA 供应链）
 #
@@ -100,7 +100,7 @@ jobs:
         working-directory: caos-ca
         run: cargo build --release --target "$RUST_TARGET"
 
-      - name: Verify statically linked ELF (build.sh Stage 1 验收)
+      - name: Verify statically linked ELF (manage.sh build Stage 1 验收)
         working-directory: caos-ca
         run: |
           BIN="target/$RUST_TARGET/release/caos-ca"

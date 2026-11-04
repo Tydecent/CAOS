@@ -47,7 +47,10 @@ project/
 │   │   ├── post-image.sh             # FAT32 ESP、GRUB EFI、genimage GPT
 │   │   ├── patches/musl/             # BR2_GLOBAL_PATCH_DIR：musl 补丁
 │   │   └── users.txt                 # caos UID/GID 1000
-├── build.sh                          # 一键构建（Rust → Buildroot → 验证）
+├── manage.sh                         # 唯一项目管理入口（解析 + 分发，无业务逻辑）
+├── script/                           # manage.sh 实现层（见 script/README.md）
+│   ├── lib/                          # 通用库：common/config/state/buildroot/verify/flash
+│   └── commands/                     # 子命令：doctor/build/verify/package/clean/flash/run/version/release
 ├── README.md
 └── output/                           # 所有构建输出（不在 Buildroot 源码树内）
     ├── dl/                           # Buildroot 下载缓存
@@ -101,7 +104,7 @@ rustup toolchain install stable
 rustup target add x86_64-unknown-linux-musl
 ```
 
-`musl-gcc`（`musl-tools` 包）是必需的：`ring` 的 C/汇编代码必须用 musl C 工具链编译。`build.sh` 会检查 `rustup target`、`musl-gcc`、`unsquashfs`、`python3`、`file` 等前置条件；缺失时直接失败，不会伪造成功。
+`musl-gcc`（`musl-tools` 包）是必需的：`ring` 的 C/汇编代码必须用 musl C 工具链编译。`./manage.sh doctor` 会检查 `rustup target`、`musl-gcc`、`unsquashfs`、`python3`、`file` 等前置条件；缺失时直接失败，不会伪造成功。
 
 Buildroot 会自行构建 host 工具（host-genimage、host-mtools、host-dosfstools、host-grub2、target grub2 等），因此不需要手工安装这些工具。UEFI 启动链使用 Buildroot 2026.08.1 自带的 **GRUB 2.14 x86_64-efi** 包；配置中只选择 `BR2_TARGET_GRUB2_X86_64_EFI`，没有选择 `i386-pc` 或其他 BIOS 平台，也没有自定义 SYSLINUX 包。
 
@@ -118,16 +121,19 @@ Buildroot 会自行构建 host 工具（host-genimage、host-mtools、host-dosfs
 ### 2.3 一键构建
 
 ```bash
-./build.sh
+./manage.sh doctor              # 环境体检：工具链、Rust target、Buildroot 树
+./manage.sh build -j 8          # 构建（Stage 1-3/5）
+./manage.sh verify              # 验收（Stage 4，只读，可单独反复执行）
+./manage.sh package             # 打包 dist/（镜像四件套 + SHA256SUMS + build-info）
 ```
 
-如果构建机内存较小，可用 `JOBS=8 ./build.sh` 限制 Buildroot 并发；本项目在约 14 GiB 内存的主机上使用 `JOBS=8` 完成最终构建。脚本使用 `set -euo pipefail`，任一阶段失败立即退出。阶段如下：
+全部配置走 CLI 参数（`--help` 查看完整清单）：`-o/--output` 输出目录、`-b/--buildroot` Buildroot 源码树、`-d/--download-dir` 下载缓存、`-j/--jobs` 并行度、`--skip-clippy` 跳过 lint、`--clean` 构建前清空输出目录（仅本地排查用）。不读取 `JOBS` 等环境变量；构建机内存较小时用 `./manage.sh build -j 8` 限制并发，本项目在约 14 GiB 内存的主机上以 `-j 8` 完成最终构建。`manage.sh` 使用 `set -Eeuo pipefail`，任一阶段失败立即退出；构建期间持有 `output/.state/build.lock` 排他锁，重复启动会直接报错。阶段如下：
 
-1. 检查/安装 `x86_64-unknown-linux-musl` target；
-2. `cargo build --release --target x86_64-unknown-linux-musl`，检查 `file` 输出包含 `statically linked`，运行 `cargo clippy -- -D warnings`，将二进制安装到 overlay；
-3. 执行 `make O=output BR2_EXTERNAL=caos-buildroot caos_defconfig`；
-4. 执行完整 Buildroot 构建（大阶段，耗时最长）；
-5. 验证标准 GPT/ESP 分区表、`\EFI\BOOT\BOOTX64.EFI` 默认启动路径、GRUB 命令行、内核 `CONFIG_NET`/GPT 设置、`rootfs.squashfs` 与镜像内文件，并打印产物大小。
+1. （`doctor` / `build` 前置检查）确认 `x86_64-unknown-linux-musl` target 已安装（缺失时只报告，不自动安装）；
+2. `cargo build --release --locked --target x86_64-unknown-linux-musl`，检查 `file` 输出包含 `statically linked`（或 `static-pie linked`），运行 `cargo clippy --release --locked -- -D warnings`，将二进制安装到 overlay；
+3. 执行 `make O=<output> BR2_EXTERNAL=caos-buildroot caos_defconfig`；
+4. 执行完整 Buildroot 构建（大阶段，耗时最长）；构建成功后写入 `output/.state/{config.env,build-info.json}`；
+5. `verify` 验证标准 GPT/ESP 分区表、`\EFI\BOOT\BOOTX64.EFI` 默认启动路径、GRUB 命令行、内核 `CONFIG_NET`/GPT 设置、`rootfs.squashfs` 与镜像内文件；`package` 生成产物清单与 `SHA256SUMS`。
 
 预计耗时：在 24 核机器上，首次构建（含下载、工具链、内核、squashfs、镜像）通常需要 **约 15–40 分钟**，主要取决于网络、内存与 CPU。增量构建会快很多。实测数据见第 8 节。
 
@@ -175,7 +181,7 @@ EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假
 
 缓存整棵 `output/` 而不是逐个挑子目录，是因为 Buildroot 的内部布局（staging、`include/config`、per-package 目录）随版本变化，漏一个就等于白缓存；`output/` 本来就是"一次构建的全部状态"，整体搬运最不容易出错。
 
-构建输入指纹只覆盖"会改变 Buildroot 产物"的文件：`caos-buildroot/configs/*`、`external.{desc,mk}`、`Config.in`、`board/caos` 下的内核/BusyBox 片段、musl 补丁、`grub*.cfg`、`genimage.cfg`、`users.txt`，以及 `build.sh`。以下内容**刻意排除**，因为它们每次构建都会重新应用：`board/caos/rootfs-overlay/**`、`post-build.sh`、`post-fakeroot.sh`、`post-image.sh`、`validate-image.py`。
+构建输入指纹只覆盖"会改变 Buildroot 产物"的文件：`caos-buildroot/configs/*`、`external.{desc,mk}`、`Config.in`、`board/caos` 下的内核/BusyBox 片段、musl 补丁、`grub*.cfg`、`genimage.cfg`、`users.txt`，以及 `manage.sh` 与 `script/`。以下内容**刻意排除**，因为它们每次构建都会重新应用：`board/caos/rootfs-overlay/**`、`post-build.sh`、`post-fakeroot.sh`、`post-image.sh`、`validate-image.py`。
 
 改动指纹覆盖的文件（例如调整 `linux.fragment` 或 musl 补丁）会换 key，从而回到全新构建。这是刻意的取舍：Buildroot 不会因为片段或补丁内容变化而自动 `dirclean` 相关包，复用旧状态会产出与配置不符的镜像。
 
@@ -186,7 +192,7 @@ EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假
 - `state` 只在 push / tag / 手动触发时落盘；PR 只读不写，避免每个 PR 各占几 GB 把仓库 10 GB 缓存配额挤爆。构建失败也会保存——Buildroot 的 stamp 只在包成功后才写入，半成品状态可以直接续跑；
 - 键带 `run_id`，所以每次运行都写一份新状态，`restore-keys` 前缀匹配总是取最新的一份，不会像固定 key 那样永远停在第一次的快照上；旧条目由 GitHub 的 LRU 在超配额时自动淘汰。
 
-手动触发时可勾选 `disable_cache` 忽略全部缓存（排查"是不是缓存的锅"时用）；改 `CACHE_SCHEMA` 环境变量可一次性失效所有旧缓存。本地构建（`./build.sh`）本来就复用 `output/`，不需要额外开关。
+手动触发时可勾选 `disable_cache` 忽略全部缓存（排查"是不是缓存的锅"时用）；改 `CACHE_SCHEMA` 环境变量可一次性失效所有旧缓存。本地构建（`./manage.sh build`）本来就复用 `output/`，不需要额外开关。
 
 
 
@@ -194,14 +200,17 @@ EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假
 
 > **警告：写错设备会覆盖该磁盘上的数据。** 擦除模式会重写整盘；烧录前用 `lsblk` 核对设备名、容量和型号，并备份证书数据。
 
-镜像大小约 321 MiB。先用 `lsblk` 确认设备名；烧录脚本要求设置整盘设备环境变量，不要指定 `/dev/sdX1` 这类分区：
+镜像大小约 321 MiB。先用 `lsblk` 确认设备名；烧录命令要求传入**整盘设备**，不要指定 `/dev/sdX1` 这类分区：
 
 ```bash
 lsblk -o NAME,SIZE,MODEL,TRAN
-sudo env CAOS_DEVICE=/dev/sdX ./flash.sh
+sudo ./manage.sh flash /dev/sdX                          # 交互模式
+sudo ./manage.sh flash /dev/sdX --image out.img --erase --yes   # 非交互
+sudo ./manage.sh flash /dev/sdX --keep                   # 只更新系统分区
+sudo ./manage.sh flash /dev/sdX --dry-run                # 只打印 dd 命令
 ```
 
-脚本默认使用 `output/images/sdcard.img`，也可用 `CAOS_IMAGE` 指定其他镜像。检测到已有 `CAOSDATA` 证书数据分区时，会询问保留、擦除或取消：选择保留只更新 ESP 和根文件系统，GPT 与 CAOSDATA 不会被写入；选择擦除会重写整盘并清空 CAOSDATA。脚本还会要求再次输入目标设备路径确认。烧录后安全弹出介质再拔出。
+默认使用 `output/images/sdcard.img`，可用 `--image PATH` 指定其他镜像。检测到已有 `CAOSDATA` 证书数据分区时，会询问保留、擦除或取消（`--keep`/`--erase` 可跳过交互）：选择保留只更新 ESP 和根文件系统，GPT 与 CAOSDATA 不会被写入；选择擦除会重写整盘并清空 CAOSDATA。命令还会要求再次输入目标设备路径确认（`--yes` 跳过；非交互模式必须显式提供 `--keep|--erase` 与 `--yes`）。烧录后安全弹出介质再拔出。
 
 镜像只支持 **x86_64 UEFI**。目标机需要关闭 Legacy/CSM（或设置为 UEFI-only），并从这张 GPT 介质的 ESP 启动。固件应能识别标准可移动介质路径 `\EFI\BOOT\BOOTX64.EFI`；不同厂商固件通常在启动菜单中显示为 `UEFI: <介质名>`，若默认启动顺序没有选中它，请在一次性 Boot Menu 中手工选择，或用固件设置把它加入启动顺序。镜像没有 BIOS、PXE 或网络启动路径。
 
@@ -457,7 +466,7 @@ Verification successful.
 
 ### 6.1 关闭网络：`CONFIG_NET=n` 的验证
 
-构建时 `build.sh` 会直接检查 `output/build/linux-6.18.55/.config`。也可以手工执行：
+构建时 `manage.sh verify` 会直接检查 `output/build/linux-6.18.55/.config`。也可以手工执行：
 
 ```bash
 grep -n '^# CONFIG_NET is not set$' output/build/linux-6.18.55/.config
@@ -501,7 +510,7 @@ board/caos/patches/musl/0001-nscd_query-treat-ENOSYS-as-no-nscd.patch
 +       if (errno == EAFNOSUPPORT || errno == ENOSYS) {
 ```
 
-补丁目录通过 `BR2_GLOBAL_PATCH_DIR` 挂到 Buildroot（只在外部树里，不改 Buildroot 源码），`build.sh` 会检查最终参与构建的 musl 源码确实带有这一行。
+补丁目录通过 `BR2_GLOBAL_PATCH_DIR` 挂到 Buildroot（只在外部树里，不改 Buildroot 源码），`manage.sh verify` 会检查最终参与构建的 musl 源码确实带有这一行。
 
 ### 6.2 CA 文件完整性
 
@@ -587,7 +596,7 @@ print(f"OK: {n} audit records, tip={prev}")
 - 没有实现常驻 daemon。`caos-ca` 是手动 CLI；`S20caos-ca` 的职责就是“启动前校验并退出”，与需求中的可选路径一致。
 - `genimage.cfg` 只生成标准 GPT（`partition-table-type = "gpt"`），p1 类型为 EFI System Partition；GPT 名称提供 `CAOSROOT`/`CAOSDATA` 定位依据。保护性 MBR 由 GPT 规范要求，只有 `0xEE` 项，没有引导代码或 active 标志。
 - UEFI 启动链：Buildroot 的 GRUB 2.14 `x86_64-efi` 应用 → `\EFI\BOOT\BOOTX64.EFI`；嵌入脚本按 FAT 卷标 `CAOSBOOT` 找到 ESP 并执行 `\EFI\BOOT\grub.cfg`；菜单项用 `linux /zImage ...` 传递完整命令行。`post-image.sh` 只创建 FAT32 ESP 并调用 `genimage`，不写 BIOS MBR 引导代码、不安装 SYSLINUX；genimage 按 GPT 规范生成保护性 MBR。
-- `board/caos/validate-image.py` 独立解析 GPT 头、主/备份分区数组、保护性 MBR、ESP FAT 标签和 CAOSDATA 空白状态，`build.sh` 在 Stage 4 调用它。
+- `board/caos/validate-image.py` 独立解析 GPT 头、主/备份分区数组、保护性 MBR、ESP FAT 标签和 CAOSDATA 空白状态，`manage.sh verify` 调用它。
 - `BR2_GLOBAL_PATCH_DIR=board/caos/patches`：目前只有一个 musl 补丁（`nscd_query.c` 把 `ENOSYS` 也当作“没有 nscd”），用于让 `su`/`initgroups()` 在 `CONFIG_NET=n`（没有 `socket(2)`）的内核上工作。补丁仍留在外部树内，Buildroot 源码树依旧零修改。
 
 
@@ -605,11 +614,11 @@ print(f"OK: {n} audit records, tip={prev}")
 
 构建流程实际执行情况：
 
-- 首次迁移构建清空 `output/build`、`output/host`、`output/images`、`output/.config` 等全部构建状态（保留 `output/dl` 下载缓存），清理 Rust target 后，以 `JOBS=8 ./build.sh` 重新构建；Stage 5 于 `20:36` 成功。
-- 修复 UEFI framebuffer console 时，在 `linux.fragment` 增加 `DRM_FBDEV_EMULATION`/`simpledrm`/`fbcon` 后，以 `JOBS=8 ./build.sh` 增量重建；内核和镜像于 `20:49` 重新生成，Rust/工具链/GRUB 复用已构建结果。
+- 首次迁移构建清空 `output/build`、`output/host`、`output/images`、`output/.config` 等全部构建状态（保留 `output/dl` 下载缓存），清理 Rust target 后，以 `./manage.sh build -j 8` 重新构建；Stage 5 于 `20:36` 成功。
+- 修复 UEFI framebuffer console 时，在 `linux.fragment` 增加 `DRM_FBDEV_EMULATION`/`simpledrm`/`fbcon` 后，以 `./manage.sh build -j 8` 增量重建；内核和镜像于 `20:49` 重新生成，Rust/工具链/GRUB 复用已构建结果。
 - 修复 LUKS2 初始化时，在 `caos_defconfig` 增加 `BR2_PACKAGE_LIBGCRYPT=y` 并清理重建 `cryptsetup`；`09:51` 重新生成 rootfs 和 `sdcard.img`。
 - 针对 ASUS 兼容性关闭 `SOUND`、`INTEL_MEI`、`DRM_I915` 后，`10:01` 重新生成内核和镜像；内核从 10,343,424 字节降到 8,311,808 字节。
-- 修复 `su: can't set groups` 时，新增 `BR2_GLOBAL_PATCH_DIR` + musl 补丁（见 6.1 与 8.7）。因为改的是 libc，必须重建工具链：清空 `output/build`、`output/host`、`output/target`、`output/images`、`output/.config` 等（保留 `output/dl`），`14:01` 以 `JOBS=8 ./build.sh` 完整重跑，Stage 5 成功。
+- 修复 `su: can't set groups` 时，新增 `BR2_GLOBAL_PATCH_DIR` + musl 补丁（见 6.1 与 8.7）。因为改的是 libc，必须重建工具链：清空 `output/build`、`output/host`、`output/target`、`output/images`、`output/.config` 等（保留 `output/dl`），`14:01` 以 `./manage.sh build -j 8` 完整重跑，Stage 5 成功。
 - 五次构建的 Buildroot 源码树在构建后 `git status --short --untracked-files=all` 均为空，没有生成 `buildroot-2026.08.1/output/`。
 - `output/build.log` 的错误扫描：
 
@@ -674,7 +683,7 @@ $ grep -nE '^(CONFIG_(DRM_FBDEV_EMULATION|DRM_SIMPLEDRM|SYSFB_SIMPLEFB|FRAMEBUFF
 - `CONFIG_MODULES=n` 时 `STRICT_MODULE_RWX` 符号本身被隐藏，最终 `.config` 仅保留 `CONFIG_ARCH_HAS_STRICT_MODULE_RWX=y`；需求强制片段中已经包含 `CONFIG_STRICT_MODULE_RWX=y`。
 - 最终 `.config` 中网络启用符号数量为 0。
 - 显示控制台不再依赖传统 VGA 文本模式。UEFI 只提供 GOP framebuffer，因此启用 `CONFIG_DRM_FBDEV_EMULATION=y`、`CONFIG_DRM_SIMPLEDRM=y`、`CONFIG_SYSFB_SIMPLEFB=y`、`CONFIG_FRAMEBUFFER_CONSOLE=y` 和 `CONFIG_FRAMEBUFFER_CONSOLE_DETECT_PRIMARY=y`；`CONFIG_FB` 仍为 `n`，由 DRM fbdev 提供 `fb0`/`fbcon`。
-- **LUKS2 不能使用 cryptsetup 的 kernel crypto backend。** `CONFIG_NET=n` 后，`CRYPTO_USER_API_HASH`/`CRYPTO_USER_API_SKCIPHER` 等 AF_ALG 接口被隐藏，`cryptsetup` 初始化 kernel backend 时 `socket(AF_ALG)` 失败，表现为 `Cannot initialize crypto backend` / `Failed to set pbkdf parameters`。因此 defconfig 增加 `BR2_PACKAGE_LIBGCRYPT=y`，Buildroot 的 cryptsetup 配置为 `--with-crypto_backend=gcrypt`，Argon2 仍由 `libargon2` 提供；内核侧 `CONFIG_DM_CRYPT=y`、`CONFIG_CRYPTO_AES=y`、`CONFIG_CRYPTO_XTS=y` 负责挂载后的 dm-crypt 数据路径。`build.sh` 同时检查这三个内核选项和 cryptsetup 的 gcrypt 配置，防止回退到需要 AF_ALG 的 kernel backend。
+- **LUKS2 不能使用 cryptsetup 的 kernel crypto backend。** `CONFIG_NET=n` 后，`CRYPTO_USER_API_HASH`/`CRYPTO_USER_API_SKCIPHER` 等 AF_ALG 接口被隐藏，`cryptsetup` 初始化 kernel backend 时 `socket(AF_ALG)` 失败，表现为 `Cannot initialize crypto backend` / `Failed to set pbkdf parameters`。因此 defconfig 增加 `BR2_PACKAGE_LIBGCRYPT=y`，Buildroot 的 cryptsetup 配置为 `--with-crypto_backend=gcrypt`，Argon2 仍由 `libargon2` 提供；内核侧 `CONFIG_DM_CRYPT=y`、`CONFIG_CRYPTO_AES=y`、`CONFIG_CRYPTO_XTS=y` 负责挂载后的 dm-crypt 数据路径。`manage.sh verify` 同时检查这三个内核选项和 cryptsetup 的 gcrypt 配置，防止回退到需要 AF_ALG 的 kernel backend。
 - `CONFIG_EFI_PARTITION=y` 保证 `root=PARTLABEL=CAOSROOT` 能从标准 GPT 解析分区名；最终 `.config` 中 **只有** `CONFIG_EFI_PARTITION=y`，`# CONFIG_MSDOS_PARTITION is not set`，镜像不依赖 DOS/MBR 分区解析器。
 - 内核由 GRUB 的 `linux` 命令通过 Linux boot protocol 装载，不需要把 `bzImage` 当作 EFI 可执行文件直接启动；`CONFIG_EFI`/`CONFIG_EFI_STUB` 是 x86_64 defconfig 的既有设置，不是本启动链的额外依赖。
 
@@ -900,7 +909,7 @@ SU_INTERACTIVE_RC=0
 
 即：补充组集合、HOME、uid/gid 切换都正确，`-c` 单命令形式与交互 shell 形式都可用，`S20caos-ca` 的 `su ... -c "caos-ca verify"` 也不再因 `su` 失败而误报完整性校验失败。完整串口记录见 [su-fix.log](output/verification/su-fix.log)。
 
-构建期守卫在 `build.sh` Stage 4：
+构建期守卫在 `manage.sh verify`：
 
 ```text
 [CAOS] musl getgrouplist()/initgroups() work without socket syscalls (.../musl-1.2.6/src/passwd/nscd_query.c)
