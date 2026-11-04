@@ -41,8 +41,7 @@ script/
 全局参数（一律 CLI，不读 `JOBS`/`CAOS_*` 等环境变量）：
 
 ```bash
-./manage.sh [-o DIR] [-b DIR] [-d DIR] [-j N] [--clean] [--skip-clippy] \
-            [--skip-verify] [-v] [--json] <子命令> [参数...]
+./manage.sh [全局参数] <子命令> [全局参数] [子命令参数...]
 ```
 
 ## 状态目录 output/.state/

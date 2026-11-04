@@ -14,7 +14,7 @@ cmd_build_usage() {
 用法: ./manage.sh build [--verify]
 
 说明:
-  全局选项（-o/-b/-d/-j/--clean/--skip-clippy/-v）在子命令之前传，例如:
+    全局选项（-o/-b/-d/-j/--clean/--skip-clippy/-v）可放在子命令前后，例如:
     ./manage.sh build -j 8 --buildroot /path/to/buildroot
 
 参数:

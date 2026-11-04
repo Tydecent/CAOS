@@ -44,15 +44,20 @@ STATE_DIR=""
 ESP_SKIP_SECTORS=2048
 ESP_COUNT_SECTORS=131072
 
-# 解析子命令之前的全局选项。支持 --opt=val、--opt val、-j8、-j 8。
-# 第一个非选项参数起（含其后全部参数）存入 PARSED_ARGS，交给子命令。
+# 解析全局选项。支持 --opt=val、--opt val、-j8、-j 8；可放在子命令前后。
+# 子命令专属选项保留在 PARSED_ARGS 中交给子命令，-- 后内容不再解析。
 parse_global_args() {
     PARSED_ARGS=()
+    local command_seen=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -h|--help)
-                top_usage
-                exit 0
+                if [ "$command_seen" -eq 1 ]; then
+                    PARSED_ARGS+=("$1")
+                else
+                    top_usage
+                    exit 0
+                fi
                 ;;
             -v|--verbose)   OPT_VERBOSE=1 ;;
             --json)         OPT_JSON=1 ;;
@@ -90,11 +95,15 @@ parse_global_args() {
                 return 0
                 ;;
             -*)
-                die 2 "未知全局选项: $1（运行 ./manage.sh --help 查看用法）"
+                if [ "$command_seen" -eq 1 ]; then
+                    PARSED_ARGS+=("$1")
+                else
+                    die 2 "未知全局选项: $1（运行 ./manage.sh --help 查看用法）"
+                fi
                 ;;
             *)
-                PARSED_ARGS+=("$@")
-                return 0
+                command_seen=1
+                PARSED_ARGS+=("$1")
                 ;;
         esac
         shift
