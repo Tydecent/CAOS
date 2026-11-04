@@ -170,6 +170,13 @@ jobs:
       - name: Prepare cache mount point
         run: mkdir -p output
 
+      # 克隆Buildroot，由于Doctor会判断../是否有Buildroot目录，所以这里要提前。
+      - name: Clone Buildroot ${{ env.BUILDROOT_VERSION }} (shallow)
+        run: |
+          git clone --depth 1 --branch "$BUILDROOT_VERSION" \
+            https://github.com/buildroot/buildroot.git "$BUILDROOT_DIR"
+          git -C "$BUILDROOT_DIR" rev-parse --short HEAD
+
       # 环境体检：缺工具/缺 Rust target 时立即失败并给出可操作提示
       - name: Doctor
         run: ./manage.sh doctor
@@ -234,12 +241,6 @@ jobs:
       - name: cargo test (quick gate before long build)
         working-directory: caos-ca
         run: cargo test --release --locked --target "$RUST_TARGET"
-
-      - name: Clone Buildroot ${{ env.BUILDROOT_VERSION }} (shallow)
-        run: |
-          git clone --depth 1 --branch "$BUILDROOT_VERSION" \
-            https://github.com/buildroot/buildroot.git "$BUILDROOT_DIR"
-          git -C "$BUILDROOT_DIR" rev-parse --short HEAD
 
       # 注意：不要在 CI 传 --clean——缓存恢复的 output/ 会被整目录清空，
       # 导致缓存永远无法命中。--clean 只用于本地手动排查。
