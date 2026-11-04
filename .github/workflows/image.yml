@@ -1,15 +1,31 @@
-# Buildroot Image — CAOS 气隙镜像全量构建与验收流水线
+# Buildroot Image — CAOS 气隙镜像构建与验收流水线
 #
 # 执行 build.sh 一键构建（README 2.3）：
 #   Stage 1  Rust 静态二进制 → rootfs overlay
 #   Stage 2  Buildroot caos_defconfig
-#   Stage 3  Buildroot 全量构建（长阶段）
+#   Stage 3  Buildroot 构建（长阶段）
 #   Stage 4  GPT/ESP/内核策略/rootfs 验收（validate-image.py 等）
 #   Stage 5  产物清点
 #
-# 触发策略说明：完整构建在 4 核 runner 上约 45–90 分钟，
-# 因此 pull_request 仅在构建相关路径变更时运行；
-# push 到主分支 / 打 tag / 手动触发均可全量构建。
+# 编译缓存（README 2.5）分两层：
+#   1. rust-cache   caos-ca/target（cargo 编译产物，由 Swatinem/rust-cache 管理）
+#   2. state        整棵 output/（Buildroot 构建状态、源码包、内核/GRUB 产物）
+#                   key = br2-state-<schema>-<Buildroot 版本>-<构建输入指纹>
+#                         -<工作目录指纹>-<run_id>，靠 restore-keys 前缀回退
+#                   到同一指纹下最近保存的一份
+#
+# state 命中时，Buildroot 的包 stamp 全部有效，make 只重跑
+# target-finalize、squashfs 打包与 genimage，整条流水线从约 45–90 分钟
+# 降到约 5–10 分钟；只要 caos-ca（Rust 代码）或 rootfs overlay 变化就足够，
+# 因为 overlay 会在每次 target-finalize 时重新落盘。
+#
+# 指纹只覆盖"真正影响构建产物"的输入（defconfig、内核/busybox 片段、
+# musl 补丁、grub/genimage 配置、build.sh）。改这些会换 key 从而走全新
+# 构建——这是刻意为之：Buildroot 不会因为片段或补丁变化而自动 dirclean
+# 相关包，复用旧状态会产出与配置不符的镜像。
+#
+# 触发策略说明：pull_request 仅在构建相关路径变更时运行；
+# push 到主分支 / 打 tag / 手动触发均可构建。
 #
 # 产物：sdcard.img（GPT 镜像）、boot.vfat、rootfs.squashfs、bzImage
 # 以及 output/verification/ 验收摘要。
@@ -23,6 +39,11 @@ on:
         description: "Buildroot 并行度 JOBS（默认 4，对应 4 vCPU runner）"
         required: false
         default: "4"
+      disable_cache:
+        description: "忽略编译缓存，强制全新构建（排查缓存相关问题时使用）"
+        type: boolean
+        required: false
+        default: false
   push:
     branches: [main, master]
     tags: ["v*"]
@@ -51,22 +72,26 @@ env:
   # build.sh 通过 BUILDROOT_DIR 环境变量定位 Buildroot 源码树
   BUILDROOT_DIR: ${{ github.workspace }}/../buildroot-2026.08.1
   RUST_TARGET: x86_64-unknown-linux-musl
+  # 缓存格式版本号：缓存内容结构或键规则变化时递增，可一次性失效全部旧缓存
+  CACHE_SCHEMA: v1
 
 jobs:
   build:
     name: build.sh (Rust + Buildroot + 镜像验收)
     runs-on: ubuntu-latest
-    # 4 vCPU runner 上全量构建预计 45–90 分钟；上限放宽到 3 小时
+    # 4 vCPU runner 上全新构建预计 45–90 分钟；上限放宽到 3 小时
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
-      # Buildroot 全量构建（工具链 + 内核 + 包 + 下载缓存）需要大量磁盘。
+      # Buildroot 构建（工具链 + 内核 + 包 + 下载缓存）需要大量磁盘，
+      # 再叠加恢复出来的编译缓存时更是如此。
       # GitHub 托管 runner 预装的 Android/.NET/GHC 等与本构建无关，先行清理。
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/powershell /usr/share/swift || true
+                      /usr/local/share/powershell /usr/share/swift \
+                      /opt/az /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           df -h /
 
@@ -88,6 +113,116 @@ jobs:
           workspaces: caos-ca
           key: image-build
 
+      # ------------------------------------------------------------------
+      # 编译缓存键：滚动缓存（rolling cache）
+      #
+      # 写 key 带 run_id/run_attempt，保证每次运行都能落盘一份新状态；
+      # 读的时候靠 restore-keys 前缀匹配，GitHub 会挑最新的那条。
+      # 这样缓存永远是"最近的构建状态"，而不会像固定 key 那样永远停在
+      # 第一次创建时的快照上。
+      # ------------------------------------------------------------------
+      - name: Compute cache keys
+        id: keys
+        run: |
+          set -euo pipefail
+
+          # 只有会改变 Buildroot 产物的输入参与指纹：
+          #   - defconfig、external.desc/Config.in/external.mk
+          #   - board/caos 下的内核片段、busybox 片段、musl 补丁、grub/genimage 配置
+          #   - build.sh（Stage 2/3 的 make 调用方式）
+          # 刻意排除 rootfs-overlay、post-build/post-fakeroot/post-image 与
+          # validate-image.py：它们每次 make 都会重新执行（overlay 由
+          # target-finalize 重新复制，post-*.sh 每次重新调用，校验脚本只在
+          # Stage 4 跑），所以只改 Rust 代码、init 脚本、overlay 或验收脚本时
+          # 仍然能命中缓存走增量路径。
+          mapfile -t inputs < <(
+            find caos-buildroot -type f \
+              ! -path 'caos-buildroot/board/caos/rootfs-overlay/*' \
+              ! -name 'post-build.sh' \
+              ! -name 'post-fakeroot.sh' \
+              ! -name 'post-image.sh' \
+              ! -name 'validate-image.py' \
+              | LC_ALL=C sort
+          )
+          printf '参与指纹的构建输入：\n'
+          printf '  %s\n' "${inputs[@]}"
+
+          FP=$(
+            {
+              printf 'schema=%s\n' "$CACHE_SCHEMA"
+              printf 'buildroot=%s\n' "$BUILDROOT_VERSION"
+              printf '%s\n' "${inputs[@]}"
+              cat "${inputs[@]}" build.sh
+            } | sha256sum | cut -d' ' -f1
+          )
+          # Buildroot 的 host 工具链里保存了工作目录的绝对路径，
+          # 换仓库名/换目录后旧状态不可复用，因此把工作目录也纳入 key。
+          WS=$(printf '%s' "$GITHUB_WORKSPACE" | sha256sum | cut -d' ' -f1)
+
+          echo "fp=${FP:0:16}" >>"$GITHUB_OUTPUT"
+          echo "state_prefix=br2-state-${CACHE_SCHEMA}-${BUILDROOT_VERSION}-${FP:0:16}-${WS:0:8}-" >>"$GITHUB_OUTPUT"
+          echo "buildroot fingerprint: ${FP:0:16}  workspace: ${WS:0:8}"
+
+      # actions/cache 对不存在的 path 会告警，先建好 output/ 再恢复
+      - name: Prepare cache mount point
+        run: mkdir -p output
+
+      # Buildroot 构建状态：整棵 output/ 原样缓存——build/ 里的包 stamp、
+      # host/ 里的交叉工具链、target/ 里的已安装产物、dl/ 里的源码包、
+      # images/ 里的内核与 GRUB 产物。恢复后 make 会认为所有包都已构建，
+      # 只重做 target-finalize 与镜像打包。
+      #
+      # 缓存整目录而不是逐个挑子目录，是因为 Buildroot 的内部布局（staging、
+      # include/config、per-package 目录）随版本变动，漏一个就白缓存；
+      # output/ 本来就是"这次构建的全部状态"，整体搬运最不容易出错。
+      - name: Restore Buildroot build state (output/)
+        id: cache_state
+        if: github.event.inputs.disable_cache != 'true'
+        continue-on-error: true
+        uses: actions/cache/restore@v4
+        with:
+          path: output
+          key: ${{ steps.keys.outputs.state_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.keys.outputs.state_prefix }}
+
+      # 缓存是"尽力而为"的加速手段，绝不能让它影响正确性：
+      # 恢复出来的工具链先用一次静态编译探针验活，无法工作就整份丢弃重新构建。
+      - name: Validate restored Buildroot state
+        id: state_check
+        env:
+          RESTORE_OUTCOME: ${{ steps.cache_state.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${RESTORE_OUTCOME}" = "failure" ]; then
+            echo "::warning::Buildroot 状态缓存恢复失败，清空 output/ 后重新构建"
+            rm -rf output
+            mkdir -p output
+            echo "reused=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TC="output/host/bin/x86_64-buildroot-linux-musl-gcc"
+          if [ ! -x "$TC" ]; then
+            echo "::notice::没有可复用的 Buildroot 构建状态，本次执行全新构建"
+            echo "reused=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'int main(void){return 0;}\n' >/tmp/probe.c
+          if "$TC" -static /tmp/probe.c -o /tmp/probe 2>/tmp/probe.err && /tmp/probe; then
+            echo "恢复的 Buildroot 工具链可用（静态编译探针通过）"
+            echo "reused=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::warning::恢复的 Buildroot 工具链不可用（缓存损坏或工作目录变化），丢弃构建状态后重新构建"
+            sed -n '1,20p' /tmp/probe.err || true
+            rm -rf output
+            mkdir -p output
+            echo "reused=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "已构建完成的包数量: $(find output/build -maxdepth 2 -name '.stamp_target_installed' 2>/dev/null | wc -l)"
+          du -sh output 2>/dev/null || true
+          df -h /
+
       # build.sh 不含 cargo test；长构建之前先跑单元测试快速失败
       - name: cargo test (quick gate before long build)
         working-directory: caos-ca
@@ -99,19 +234,33 @@ jobs:
             https://github.com/buildroot/buildroot.git "$BUILDROOT_DIR"
           git -C "$BUILDROOT_DIR" rev-parse --short HEAD
 
-      # Buildroot 下载缓存（源码镜像数百 MiB，跨构建复用）
-      - name: Cache Buildroot downloads (output/dl)
-        uses: actions/cache@v4
-        with:
-          path: output/dl
-          key: buildroot-dl-${{ env.BUILDROOT_VERSION }}-${{ hashFiles('caos-buildroot/configs/caos_defconfig') }}
-          restore-keys: |
-            buildroot-dl-${{ env.BUILDROOT_VERSION }}-
-
       - name: Build (build.sh)
         run: |
+          echo "Buildroot 状态缓存复用: ${{ steps.state_check.outputs.reused }}"
           echo "disk before build:"; df -h /
           JOBS="${{ github.event.inputs.jobs || '4' }}" ./build.sh
+
+      # 缓存即便在构建失败时也值得保存：Buildroot 的 stamp 只在包成功后才写入，
+      # 半成品状态可以让下一次重跑直接从那一步继续，而不是再等 45 分钟。
+      #
+      # 只在主分支 / tag / 手动触发时落盘：PR 可以读取主分支的缓存（GitHub 允许
+      # 从 base 分支恢复），但每个 PR 都上传一份几 GB 的状态会很快把仓库 10 GB
+      # 的缓存配额挤爆，进而让主分支的缓存被 LRU 淘汰。
+      - name: Save Buildroot build state
+        if: always() && !cancelled() && github.event_name != 'pull_request' && github.event.inputs.disable_cache != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: output
+          key: ${{ steps.keys.outputs.state_prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Report cache usage
+        if: always()
+        run: |
+          echo "Buildroot 状态缓存: ${{ steps.state_check.outputs.reused == 'true' && '命中，增量构建' || '未命中，全量构建' }}"
+          echo "缓存键指纹: ${{ steps.keys.outputs.fp }}"
+          du -sh output output/dl output/build output/host output/target output/images 2>/dev/null || true
+          df -h /
 
       # 构建日志/验收摘要：失败时同样保留，便于排查
       - name: Upload verification & logs

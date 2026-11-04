@@ -162,6 +162,32 @@ EDK2 是固件/QEMU 镜像包，不是本机启动链的一部分；本镜像假
 
 没有为了通过构建而重新启用网络，也没有因为 `CONFIG_NET=n` 删除其他必需的存储/CA 包。`post-build.sh` 还会在镜像层拒绝上述网络命令。
 
+### 2.5 CI 编译缓存
+
+`.github/workflows/image.yml` 里配了两层 GitHub Actions 缓存，用来避免每次 push 都重跑 45–90 分钟的全量构建：
+
+| 缓存         | 路径               | 键                                                              | 作用                                    |
+| ---------- | ---------------- | -------------------------------------------------------------- | ------------------------------------- |
+| rust-cache | `caos-ca/target` | 由 `Swatinem/rust-cache` 按 `Cargo.lock` 管理                      | 复用 cargo 依赖与增量编译产物                    |
+| state      | `output/`（整棵）    | `br2-state-<schema>-<Buildroot 版本>-<构建输入指纹>-<工作目录指纹>-<run_id>` | 复用包 stamp、交叉工具链、已安装产物、源码包、内核与 GRUB 产物 |
+
+`state` 命中后，Buildroot 会认为所有包都已构建，`make` 只重跑 `target-finalize`、`rootfs.squashfs` 打包与 `genimage`，整条流水线（含 Rust 构建、验收、缓存读写、产物上传）约 **5–10 分钟**。只改 Rust 代码或 `rootfs-overlay/` 时都能命中：overlay 会在每次 `target-finalize` 时重新落盘，`post-*.sh` 也每次重新执行。
+
+缓存整棵 `output/` 而不是逐个挑子目录，是因为 Buildroot 的内部布局（staging、`include/config`、per-package 目录）随版本变化，漏一个就等于白缓存；`output/` 本来就是"一次构建的全部状态"，整体搬运最不容易出错。
+
+构建输入指纹只覆盖"会改变 Buildroot 产物"的文件：`caos-buildroot/configs/*`、`external.{desc,mk}`、`Config.in`、`board/caos` 下的内核/BusyBox 片段、musl 补丁、`grub*.cfg`、`genimage.cfg`、`users.txt`，以及 `build.sh`。以下内容**刻意排除**，因为它们每次构建都会重新应用：`board/caos/rootfs-overlay/**`、`post-build.sh`、`post-fakeroot.sh`、`post-image.sh`、`validate-image.py`。
+
+改动指纹覆盖的文件（例如调整 `linux.fragment` 或 musl 补丁）会换 key，从而回到全新构建。这是刻意的取舍：Buildroot 不会因为片段或补丁内容变化而自动 `dirclean` 相关包，复用旧状态会产出与配置不符的镜像。
+
+缓存是"尽力而为"的加速手段，不影响正确性：
+
+- 恢复后先用一次静态编译探针验证交叉工具链；探针失败、或恢复过程本身报错，就丢弃整份 `output/` 重新构建；
+- 缓存键里带工作目录指纹（Buildroot 的 host 工具链里存着绝对路径），换目录或换仓库名不会错误复用；
+- `state` 只在 push / tag / 手动触发时落盘；PR 只读不写，避免每个 PR 各占几 GB 把仓库 10 GB 缓存配额挤爆。构建失败也会保存——Buildroot 的 stamp 只在包成功后才写入，半成品状态可以直接续跑；
+- 键带 `run_id`，所以每次运行都写一份新状态，`restore-keys` 前缀匹配总是取最新的一份，不会像固定 key 那样永远停在第一次的快照上；旧条目由 GitHub 的 LRU 在超配额时自动淘汰。
+
+手动触发时可勾选 `disable_cache` 忽略全部缓存（排查"是不是缓存的锅"时用）；改 `CACHE_SCHEMA` 环境变量可一次性失效所有旧缓存。本地构建（`./build.sh`）本来就复用 `output/`，不需要额外开关。
+
 ---
 
 ## 3. 烧录
@@ -202,6 +228,7 @@ sudo screen /dev/ttyUSB0 115200
 ```
 
 日志会同时输出到 tty0 和 ttyS0；登录提示在 ttyS0 与 tty1 各有一个 getty。内核命令行把 ttyS0 放在最后一个 `console=`，因此启动阶段的 `/dev/console`（包括 LUKS 口令提示）优先走串口；请在串口终端上输入首次解锁口令。登录后 tty1 也可操作。
+
 
 ### 4.2 首次启动时 CAOSDATA 是空的
 
@@ -538,6 +565,7 @@ print(f"OK: {n} audit records, tip={prev}")
 
 需要长期可信地保存审计证据时，应定期把 `tip` 和 `verify` 结果抄录到独立的离线记录介质。
 
+
 ### 6.5 其他运行期加固
 
 - 内核 `CONFIG_STRICT_KERNEL_RWX=y`、`CONFIG_RANDOMIZE_BASE=y`、`CONFIG_STACKPROTECTOR_STRONG=y`、`CONFIG_HARDENED_USERCOPY=y`；
@@ -736,6 +764,7 @@ ESP:          FAT32 label CAOSBOOT, 64 MiB
 rootfs:       squashfs superblock present
 CAOSDATA:     all zero, no LUKS header
 ```
+
 
    另以 `sgdisk -v` 验证返回 `No problems found`，`sfdisk --verify` 返回无错误；`file -s output/images/boot.vfat` 显示 FAT32、卷标 `CAOSBOOT`、OEM-ID `mkfs.fat`（不是 SYSLINUX）。
 
