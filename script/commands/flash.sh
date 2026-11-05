@@ -143,7 +143,7 @@ cmd_flash() {
         assert_min_size "$root_part" $((128 * 1024 * 1024)) "CAOSROOT 分区"
         flash_keep "$IMAGE_PATH" "$boot_part" "$root_part"
     else
-        [ "$(blockdev --getsize64 -- "$device")" -ge "$image_bytes" ] \
+        [ "$(blockdev --getsize64 "$device")" -ge "$image_bytes" ] \
             || die 1 "目标盘容量小于镜像，拒绝烧录。"
         flash_erase "$IMAGE_PATH" "$device"
     fi

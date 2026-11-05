@@ -47,7 +47,7 @@ find_partition_by_label() {
 assert_min_size() {
     local node=$1 min_bytes=$2 desc=$3
     need blockdev
-    [ "$(blockdev --getsize64 -- "$node")" -ge "$min_bytes" ] \
+    [ "$(blockdev --getsize64 "$node")" -ge "$min_bytes" ] \
         || die 1 "$desc 小于预期大小（$(numfmt --to=iec -- "$min_bytes" 2>/dev/null || printf '%s 字节' "$min_bytes")）: $node"
 }
 
@@ -57,13 +57,13 @@ assert_min_size() {
 flash_keep() {
     local image=$1 boot_part=$2 root_part=$3
     log "[CAOS][flash] 更新 CAOSBOOT..."
-    _dd_run "if=$image of=$boot_part bs=1M skip=1 count=64 conv=fsync status=progress"
+    _dd_run "if=$image" "of=$boot_part" bs=1M skip=1 count=64 conv=fsync status=progress
     log "[CAOS][flash] 更新 CAOSROOT..."
-    _dd_run "if=$image of=$root_part bs=1M skip=65 count=128 conv=fsync status=progress"
+    _dd_run "if=$image" "of=$root_part" bs=1M skip=65 count=128 conv=fsync status=progress
 }
 
 # flash_erase IMAGE DEVICE —— 擦除模式：整盘重写
 flash_erase() {
     local image=$1 device=$2
-    _dd_run "if=$image of=$device bs=4M conv=fsync status=progress"
+    _dd_run "if=$image" "of=$device" bs=4M conv=fsync status=progress
 }
