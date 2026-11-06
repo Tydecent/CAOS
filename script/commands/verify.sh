@@ -17,7 +17,7 @@ cmd_verify_usage() {
   grub-script-check 通过；validate-image.py GPT/ESP 布局校验
   EFI 为 PE32+ 且内嵌 CAOSBOOT 查找与 grub.cfg 加载脚本
   sdcard.img 内 ESP 与 boot.vfat 一致；BOOTX64.EFI/zImage 与构建产物一致
-  ESP grub.cfg 含完整内核命令行；无 extlinux/syslinux/mbr 残留
+  ESP grub.cfg 的本地/串口启动项各含完整内核命令行；无 extlinux/syslinux/mbr 残留
   内核 .config：CONFIG_NET/MODULES 关闭、STRICT_KERNEL_RWX、RANDOMIZE_BASE、
     GPT-only 分区、dm-crypt/AES-XTS、fbcon、禁 SOUND/MEI/I915
   cryptsetup gcrypt 后端；musl nscd ENOSYS 补丁生效
@@ -140,10 +140,16 @@ cmd_verify() {
             fail_check "从 ESP 提取 BOOTX64.EFI/grub.cfg/zImage 失败"
         fi
 
-        # ESP grub.cfg 必须含完整内核命令行，且与源一致
-        local grub_append='linux /zImage console=tty0 console=ttyS0,115200 root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait'
-        grep -Fq "$grub_append" "$esp_check_dir/grub.cfg" \
-            || fail_check "ESP grub.cfg 缺少要求的 CAOS 内核命令行"
+        local grub_common='root=PARTLABEL=CAOSROOT rootfstype=squashfs ro rootwait'
+        local grub_console grub_entry
+        for grub_console in tty0 ttyS0,115200; do
+            grub_entry="linux /zImage console=$grub_console $grub_common"
+            if grep -Fq "$grub_entry" "$esp_check_dir/grub.cfg"; then
+                check_pass "ESP grub.cfg 含启动项: console=$grub_console"
+            else
+                fail_check "ESP grub.cfg 缺少启动项: $grub_entry"
+            fi
+        done
         cmp -s "$esp_check_dir/grub.cfg" "$BR2_EXTERNAL_DIR/board/caos/grub.cfg" \
             || fail_check "ESP grub.cfg 不是 CAOS 启动菜单"
     fi
